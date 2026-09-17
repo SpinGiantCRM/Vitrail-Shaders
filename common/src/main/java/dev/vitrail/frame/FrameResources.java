@@ -41,8 +41,19 @@ import org.joml.Vector3dc;
  * and inexact in either one alone: a consumer wanting a world position has the unshifted pair
  * available from the engine, and one wanting the distance the camera moved - which is what a
  * reprojection needs - has it here to the bit.
+ * <p>
+ * <strong>There are two colour resources when the world was rendered small, and the order between
+ * them is the order of the work.</strong> {@code sceneColour} is the finished scene at the size the
+ * pack drew it, before this engine's own upscale; {@code upscaledSceneColour} is the picture the
+ * window-sized target holds, which is that scene upscaled. A consumer that upscales needs the
+ * first, because upscaling the second upscales an upscale; a consumer that composites what the
+ * player will see wants the second. <strong>A null {@code upscaledSceneColour} is the honest answer
+ * and not a missing resource:</strong> at a hundred percent the world draws straight into the
+ * window-sized target, no upscale happens, and the scene and the window's picture are one image -
+ * describing it twice would say an upscale happened that did not.
  *
- * @param sceneColour            the frame's finished world colour, HUD-less, at the window size
+ * @param sceneColour            the frame's finished world colour at the render size, HUD-less
+ * @param upscaledSceneColour    the upscale of it that the window holds, or null when there is none
  * @param depth                  the pack's converted depth copy, or null when there is none
  * @param motionVectors          this frame's vectors, or null when the pass did not draw them
  * @param motionVectorImage      the image behind them, or null when none is allocated
@@ -58,6 +69,7 @@ import org.joml.Vector3dc;
  */
 public record FrameResources(
 		EngineImage sceneColour,
+		EngineImage upscaledSceneColour,
 		EngineImage depth,
 		EngineImage motionVectors,
 		EngineImage motionVectorImage,
@@ -76,6 +88,13 @@ public record FrameResources(
 			// The one resource every frame the engine exports has: a frame without it is not a
 			// frame this export has anything to say about, and the seam does not offer one.
 			throw new IllegalArgumentException("a frame must carry its scene colour");
+		}
+
+		if (upscaledSceneColour != null && upscaledSceneColour == sceneColour) {
+			// One image under both names would claim an upscale happened between two resources that
+			// are the same resource. A frame with no upscale leaves the second null instead.
+			throw new IllegalArgumentException(
+					"an upscaled scene colour must be a different image from the scene's");
 		}
 
 		if (view == null || previousView == null || projection == null || previousProjection == null) {
@@ -112,12 +131,17 @@ public record FrameResources(
 		return this.motionVectorImage != null;
 	}
 
-	/** The width of the frame's colour, in pixels. */
+	/** Whether this frame was rendered small and upscaled, so it has a second colour resource. */
+	public boolean hasUpscaledSceneColour() {
+		return this.upscaledSceneColour != null;
+	}
+
+	/** The width of the frame's scene colour, in pixels: the render size, not the window's. */
 	public int width() {
 		return this.sceneColour.width();
 	}
 
-	/** The height of the frame's colour, in pixels. */
+	/** The height of the frame's scene colour, in pixels: the render size, not the window's. */
 	public int height() {
 		return this.sceneColour.height();
 	}

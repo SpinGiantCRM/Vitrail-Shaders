@@ -55,8 +55,17 @@ import java.util.Set;
  * of the answer to "who may destroy it" - this engine, on the same paths as before, whether or not
  * anybody is listening.
  * <p>
- * <strong>What is published and what is not.</strong> Scene colour is the frame the player sees
- * without the interface, at the window's size, after the chain and after the render scale's upscale.
+ * <strong>What is published and what is not.</strong> Scene colour is the frame the chain finished,
+ * without the interface, at the size the pack drew it - the render size, which is the window's size
+ * only while the render scale is off. When the scale is engaged the world is drawn into a stand-in
+ * smaller than the window and this engine's own upscale of it is what the window ends up holding, so
+ * that second picture is published separately as {@code b3d:upscaled_scene_color}. One semantic per
+ * resource: a consumer that upscales needs the scene at the render size, a consumer that composites
+ * what the player sees needs the upscale, and neither can tell which it has been handed if one image
+ * is offered as both. On a frame the scale did not engage there is no distinct upscale and the second
+ * semantic is not published at all - a hundred percent is not a degenerate upscale, it is the
+ * absence of one, and the scene colour is then simply the image the window holds.
+ * <p>
  * Depth is the pack's own converted copy rather than the device's image: forward over 0..1, at the
  * render size, and it outlives the clear that destroys the device's window-sized depth. Motion
  * vectors are the engine's existing pass, published only on a frame it drew, which is only when a
@@ -105,6 +114,9 @@ public final class B3DFrameExport {
 
 	private static final Slot SCENE_COLOUR =
 		new Slot(ResourceKey.of(NAMESPACE, "scene_colour"), FrameSemantic.SCENE_COLOR);
+	private static final Slot UPSCALED_SCENE_COLOUR =
+		new Slot(ResourceKey.of(NAMESPACE, "upscaled_scene_colour"),
+				FrameSemantic.UPSCALED_SCENE_COLOR);
 	private static final Slot DEPTH = new Slot(ResourceKey.of(NAMESPACE, "depth"), FrameSemantic.DEPTH);
 	private static final Slot MOTION_VECTORS =
 		new Slot(ResourceKey.of(NAMESPACE, "motion_vectors"), FrameSemantic.MOTION_VECTORS);
@@ -144,12 +156,13 @@ public final class B3DFrameExport {
 		}
 
 		session = FrameExchange.attach(PROVIDER_ID);
-		session.advertises(Set.of(FrameSemantic.SCENE_COLOR, FrameSemantic.DEPTH,
-			FrameSemantic.MOTION_VECTORS));
+		session.advertises(Set.of(FrameSemantic.SCENE_COLOR, FrameSemantic.UPSCALED_SCENE_COLOR,
+			FrameSemantic.DEPTH, FrameSemantic.MOTION_VECTORS));
 		FrameExport.install(B3DFrameExport::onFrame);
 
-		Vitrail.logger().info("Publishing this engine's frames to {} as {}: scene colour, depth, and "
-			+ "motion vectors when a consumer asks for them", B3D_MOD_ID, PROVIDER_ID);
+		Vitrail.logger().info("Publishing this engine's frames to {} as {}: the scene colour at the "
+			+ "render size, its upscale when the render scale is engaged, depth, and motion vectors "
+			+ "when a consumer asks for them", B3D_MOD_ID, PROVIDER_ID);
 	}
 
 	/** Detaches the export, closing everything it published. Idempotent. */
@@ -162,6 +175,7 @@ public final class B3DFrameExport {
 
 		FrameExport.uninstall();
 		SCENE_COLOUR.close();
+		UPSCALED_SCENE_COLOUR.close();
 		DEPTH.close();
 		MOTION_VECTORS.close();
 		session.close();
@@ -224,6 +238,20 @@ public final class B3DFrameExport {
 
 		final boolean colourClaimed =
 			contributeImage(snapshot, frameId, SCENE_COLOUR, frame.sceneColour());
+		boolean upscaledClaimed = false;
+
+		if (frame.hasUpscaledSceneColour()) {
+			upscaledClaimed = contributeImage(snapshot, frameId, UPSCALED_SCENE_COLOUR,
+					frame.upscaledSceneColour());
+		} else {
+			// The frame was not rendered small, so the window's picture is the scene and not a second
+			// resource. The publication ends rather than standing over the window-sized colour from a
+			// frame whose scale has since been turned off, which a consumer would read as this frame's
+			// upscale - the one thing the exchange keeps a description from doing is describing a frame
+			// that is not the open one.
+			UPSCALED_SCENE_COLOUR.close();
+		}
+
 		boolean depthClaimed = false;
 
 		if (frame.hasDepth()) {
@@ -252,7 +280,7 @@ public final class B3DFrameExport {
 		// armed, and this says it ran.
 		sayDrawn(frame.hasMotionVectors());
 
-		if (!colourClaimed && !depthClaimed && !vectorsClaimed) {
+		if (!colourClaimed && !upscaledClaimed && !depthClaimed && !vectorsClaimed) {
 			// Nothing of this frame is this engine's to describe - no pack is drawing it, or the
 			// backend is not Vulkan - so its camera state is not published either. A frame with
 			// metadata and no resources would be a description of somebody else's frame.
@@ -475,7 +503,8 @@ public final class B3DFrameExport {
 			.jitter(TemporalFrameInfo.Jitter.none(
 				"this engine applies no jitter; a pack that offsets its own composite is not reported here"))
 			.cameraMotionIncluded(true)
-			.source("the engine's frame at the interface's depth clear, after the render scale's upscale");
+			.source("the engine's frame at the interface's depth clear, after the render scale's "
+					+ "upscale has been drawn onto the window-sized colour");
 
 		return info.build();
 	}

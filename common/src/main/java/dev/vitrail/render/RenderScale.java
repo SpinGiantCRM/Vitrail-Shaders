@@ -411,6 +411,18 @@ public final class RenderScale {
 	private static boolean swapped;
 
 	/**
+	 * Whether {@link #endWorld} drew an upscale of the stand-in onto the window-sized colour, for
+	 * whoever asks about the frame immediately after it.
+	 * <p>
+	 * A frame this class upscaled has two colour resources worth describing - the stand-in it rendered
+	 * the world into and the window-sized picture the upscale produced - and a frame it did not has
+	 * one. Both of those are decided here rather than inferred from whether {@link #scaled} happens to
+	 * be allocated: the two usually agree, and a frame the game cleared no world on is exactly where
+	 * they would not.
+	 */
+	private static boolean upscaleDrawn;
+
+	/**
 	 * Whether the world being drawn right now is going to be upscaled.
 	 * <p>
 	 * The one question worth asking for a pass that only earns its cost when something is going to
@@ -420,6 +432,26 @@ public final class RenderScale {
 	 */
 	static boolean upscaling() {
 		return swapped;
+	}
+
+	/**
+	 * The finished render-resolution world colour of the frame just ended, or null on a frame this
+	 * engine did not upscale.
+	 * <p>
+	 * Non-null is one fact and not two: the world was rendered into a stand-in smaller than the
+	 * window, and {@link #endWorld} drew the upscale of it onto the window-sized colour. The picture
+	 * the main target holds when this is read is that upscale's result, so a frame that answers here
+	 * has two colour resources to describe and a frame that answers null has one - the game's own
+	 * colour, at the window's size, because at a hundred percent the world drew straight into it.
+	 * <p>
+	 * The stand-in outlives its own upscale, which is why this can be asked at all: {@link #endWorld}
+	 * restores the window-sized set and draws, and only {@link #standDown} or {@link #close} frees the
+	 * stand-in. Everything that reads it reads it once and keeps nothing, for the reason every view in
+	 * this class is used that way: a view held across a resize is a use after free rather than an
+	 * exception.
+	 */
+	static GpuTextureView renderedColourView() {
+		return upscaleDrawn && scaled != null ? scaled.getColorTextureView() : null;
 	}
 
 	/** The window-sized set the game allocated, held only while the scaled set stands in for it. */
@@ -575,8 +607,15 @@ public final class RenderScale {
 	 */
 	public static void endWorld(RenderTarget main, CommandEncoder encoder) {
 		if (!swapped || main == null) {
+			// The frame was not rendered small, so there is no second colour resource for anything
+			// reading this after the call to describe. Cleared here rather than only set, because the
+		// answer belongs to this frame and not to the last one that happened to upscale.
+			upscaleDrawn = false;
+
 			return;
 		}
+
+		upscaleDrawn = true;
 
 		restore(main);
 
@@ -661,6 +700,10 @@ public final class RenderScale {
 		if (scaled != null) {
 			scaled.destroyBuffers();
 			scaled = null;
+			// With the image and for the same reason: the answer this carries is about a stand-in
+			// that no longer exists, and a stale yes would have the next reader describe a colour
+			// resource this class has already freed.
+			upscaleDrawn = false;
 		}
 
 		if (upscaled != null) {

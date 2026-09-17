@@ -170,6 +170,15 @@ public final class PackChain {
 	 * is destroyed by the very clear this export runs ahead of. The copy is the one this frame's own
 	 * vector pass reads, so it is also the one whose convention is already written down.
 	 *
+	 * <strong>The colour exported is the frame's scene at the render size, and the window's picture
+	 * only as the upscale of it.</strong> The two are the same image until the render scale engages,
+	 * and they separate the moment it does: the chain draws into a stand-in smaller than the window,
+	 * and the upscale of that stand-in is what the window ends up holding. A consumer that upscales
+	 * needs the first, because the second is already an upscale; a consumer that wants the picture the
+	 * player sees wants the second. The stand-in outlives its own upscale, so both are readable at this
+	 * seam, and on a frame the scale did not engage the second is absent rather than a second
+	 * description of the one colour resource there is.
+	 *
 	 * @param main  the game's render target, holding the window-sized set by the time this runs
 	 * @param index which exported frame this is, counting from one
 	 */
@@ -183,9 +192,24 @@ public final class PackChain {
 		// The one place the engine's own objects are converted to the port the description path
 		// speaks: everything after this line is a handle, a format and an extent, which is what lets
 		// the rules about replacing and invalidating them be exercised without a device.
-		EngineImage colour = EngineImage.of(main.getColorTexture(), main.getColorTextureView());
+		EngineImage windowColour =
+				EngineImage.of(main.getColorTexture(), main.getColorTextureView());
 
-		if (colour == null) {
+		if (windowColour == null) {
+			return null;
+		}
+
+		// The render scale's stand-in when this frame was rendered small, and the window's own colour
+		// when it was not - which is the same picture in that case, because at a hundred percent the
+		// world drew straight into the window-sized target. Read here and not kept: the stand-in is
+		// reallocated by a resize, a scale change or a pack reload like everything else.
+		GpuTextureView rendered = RenderScale.renderedColourView();
+		EngineImage scene = rendered == null
+				? windowColour
+				: EngineImage.of(rendered.texture(), rendered);
+		EngineImage upscaled = rendered == null ? null : windowColour;
+
+		if (scene == null) {
 			return null;
 		}
 
@@ -199,7 +223,8 @@ public final class PackChain {
 		// converted to OpenGL's volume, and pairing one of those with one of these reconstructs a
 		// position that is wrong by more the further away it is. MotionVectors carries the long
 		// version of that argument where it does the same thing for its own reprojection.
-		return new FrameResources(colour, EngineImage.of(depthView == null ? null : depthView.texture(), depthView),
+		return new FrameResources(scene, upscaled,
+				EngineImage.of(depthView == null ? null : depthView.texture(), depthView),
 				EngineImage.of(vectors.image(), vectorsView), EngineImage.of(vectors.image(), null),
 				view.gbufferModelView(),
 				view.gbufferPreviousModelView(), view.rendered(), view.previousRendered(),

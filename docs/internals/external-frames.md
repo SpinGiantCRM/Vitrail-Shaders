@@ -17,6 +17,8 @@ own clear runs. At that line:
 
 - the world, and everything the game draws after it, are finished;
 - the render scale has upscaled and sharpened onto the window-sized colour view, and has put the
+  window-sized set back into the target, and leaving its own render-sized stand-in alive, which is
+  the image the scene colour is taken from
   game's own textures back into the main target;
 - no render pass is open;
 - the interface has not been drawn, so the picture is HUD-less;
@@ -32,11 +34,25 @@ the render scale is not engaged, which is most frames of most sessions.
 
 | semantic | resource | why that one |
 | --- | --- | --- |
-| scene colour | the main target's colour view, window-sized | the picture the frame ends with, after the pack and after the upscale, before the UI |
+| scene colour | the render scale's stand-in, the finished pack output at the **render size**, or the main target's colour when no scale is engaged | it is the scene *before* this engine's own upscale, which is what a consumer that upscales needs; the window's picture is already an upscale, and upscaling it again is upscaling an upscale |
+| upscaled scene colour | the main target's colour view, window-sized, on frames the render scale upscaled | the picture the frame ends with, after the pack and after the upscale, before the UI |
 | depth | `PackDepth`'s **converted copy**, `R32_FLOAT`, render-sized, forward over 0..1 | it is the volume a pack reads depth in, it is what the engine's own vector pass consumes, and it survives the clear that destroys the device's window-sized depth |
 | motion vectors | the existing `MotionVectors` image, `RG16_FLOAT`, render-sized | it already matches the convention consumers expect, so nothing is converted |
 
-**All three are borrowed.** The engine keeps ownership, recreates and destroys them exactly as it did
+**The two colour semantics are one resource or two depending on the render scale**, and the difference
+is not decoration:
+
+- While the render scale is off, the world draws straight into the window-sized target, so the scene
+  and the window's picture are one image, and it is published as the scene colour alone.
+- While it is on, the chain draws into a stand-in smaller than the window and the engine's own upscale
+  of that stand-in is what the window ends up holding. Both images exist at the export seam, because
+  the stand-in outlives its own upscale, so they are published as two semantics at two sizes.
+
+On the frames where there is no distinct upscale, `upscaled_scene_color` is **not published at all**.
+A hundred percent is not a degenerate upscale; it is the absence of one, and publishing the window's
+picture as an upscale of itself would say an upscale happened that did not.
+
+**All of them are borrowed.** The engine keeps ownership, recreates and destroys them exactly as it did
 before, and no descriptor it hands out carries any way to destroy one. The frame's *meaning* is
 re-published every frame; the images themselves are published once and replaced only when the engine
 recreates them.
