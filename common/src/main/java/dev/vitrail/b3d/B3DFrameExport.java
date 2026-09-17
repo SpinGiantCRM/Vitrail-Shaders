@@ -82,8 +82,12 @@ import java.util.Set;
  */
 public final class B3DFrameExport {
 
-	/** The mod id this integration is for. Read before anything of it is loaded. */
-	public static final String MOD_ID = "b3dinterop";
+	/**
+	 * The mod id of the external frame API, as that mod's own loader metadata spells it. Not the same
+	 * string as the package the API's classes live in: the package is {@code b3dinterop}, the mod is
+	 * {@code b3d-interop}, and a lookup by the wrong one simply never matches.
+	 */
+	public static final String B3D_MOD_ID = "b3d-interop";
 
 	/**
 	 * A demand this mod registers for itself, for the runtime validation: {@code <semantic>} or
@@ -128,6 +132,7 @@ public final class B3DFrameExport {
 	private static long failures;
 	private static boolean motionVectorsDrawn;
 	private static boolean motionVectorsWanted;
+	private static boolean planesAbsentSaid;
 	private static long lastDemandVersion = -1L;
 
 	/**
@@ -164,7 +169,7 @@ public final class B3DFrameExport {
 		registerSelfTest();
 
 		Vitrail.logger().info("Publishing this engine's frames to {} as {}: scene colour, depth, and "
-			+ "motion vectors when a consumer asks for them", MOD_ID, PROVIDER_ID);
+			+ "motion vectors when a consumer asks for them", B3D_MOD_ID, PROVIDER_ID);
 	}
 
 	/** Detaches the export, closing everything it published. Idempotent. */
@@ -185,6 +190,7 @@ public final class B3DFrameExport {
 		session = null;
 		motionVectorsDrawn = false;
 		motionVectorsWanted = false;
+		planesAbsentSaid = false;
 		lastDemandVersion = -1L;
 		stoodDown.clear();
 
@@ -425,9 +431,27 @@ public final class B3DFrameExport {
 
 	/** How this frame's depth must be read, which is the pack's copy and not the device image. */
 	private static DepthConvention depthConvention(final FrameResources frame) {
-		return DepthConvention.declare(DepthConvention.Direction.NORMAL, DepthConvention.Range.ZERO_TO_ONE,
-				DepthConvention.Linearity.NON_LINEAR, REASON_DEPTH_COPY)
-			.withPlanes(frame.nearPlane(), frame.farPlane());
+		final DepthConvention convention = DepthConvention.declare(DepthConvention.Direction.NORMAL,
+			DepthConvention.Range.ZERO_TO_ONE, DepthConvention.Linearity.NON_LINEAR, REASON_DEPTH_COPY);
+
+		return planesKnown(frame)
+			? convention.withPlanes(frame.nearPlane(), frame.farPlane())
+			: convention;
+	}
+
+	/**
+	 * Whether the frame's near and far planes are genuinely stated.
+	 * <p>
+	 * A frame that has not set them reports a far plane of zero, and the temporal contract refuses a
+	 * near plane that is not closer than the far one - correctly, because a consumer would otherwise
+	 * reconstruct a position from a distance nobody stated. There is a frame like that on the title
+	 * screen, which is why this is asked rather than assumed: a frame without planes says so.
+	 */
+	private static boolean planesKnown(final FrameResources frame) {
+		final double near = frame.nearPlane();
+		final double far = frame.farPlane();
+
+		return Double.isFinite(near) && Double.isFinite(far) && near > 0.0 && far > near;
 	}
 
 	/** How this frame's motion vectors must be read: the canonical convention, unchanged. */
@@ -453,8 +477,15 @@ public final class B3DFrameExport {
 			.projection(frame.projection())
 			.previousProjection(frame.previousProjection())
 			.cameraPosition(position(frame.cameraPosition()))
-			.previousCameraPosition(position(frame.previousCameraPosition()))
-			.planes(frame.nearPlane(), frame.farPlane())
+			.previousCameraPosition(position(frame.previousCameraPosition()));
+
+		if (planesKnown(frame)) {
+			info.planes(frame.nearPlane(), frame.farPlane());
+		} else {
+			sayPlanesUnknown();
+		}
+
+		info
 			// The engine applies no jitter of its own: seven of the eight packs of the corpus
 			// already offset their own composite, and a jitter added here would be applied twice.
 			.jitter(TemporalFrameInfo.Jitter.none(
@@ -467,6 +498,18 @@ public final class B3DFrameExport {
 
 	private static TemporalFrameInfo.Position position(final Vector3dc at) {
 		return TemporalFrameInfo.Position.of(at.x(), at.y(), at.z());
+	}
+
+	/** Says once that this frame states no planes, which is the truth rather than a zero. */
+	private static void sayPlanesUnknown() {
+		if (planesAbsentSaid) {
+			return;
+		}
+
+		planesAbsentSaid = true;
+		Vitrail.logger().info("This frame states no near and far planes, so none are published for it "
+			+ "rather than a zero a consumer would reconstruct a position from. Frames drawn without a "
+			+ "world camera are the ones that have none.");
 	}
 
 	/** Asks for a temporal reset, in the exchange's terms, with this engine's reason. */

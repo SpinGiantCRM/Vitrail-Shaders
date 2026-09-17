@@ -35,7 +35,7 @@
 		"fabric-lifecycle-events-v1": "*"
 	},
 	"suggests": {
-		"b3dinterop": "*"
+		"b3d-interop": "*"
 	},
 	"custom": {
 		"sodium:options": {

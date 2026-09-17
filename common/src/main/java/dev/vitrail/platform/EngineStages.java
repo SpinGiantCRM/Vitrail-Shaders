@@ -375,6 +375,9 @@ public final class EngineStages {
 		}
 	}
 
-	/** The mod whose frame API this engine can publish into, when the player has it. */
-	private static final String B3D_MOD_ID = "b3dinterop";
+	/**
+	 * The mod whose frame API this engine can publish into, when the player has it. The mod id, not
+	 * the package its classes live in: the two differ, and only the mod id answers a loader lookup.
+	 */
+	private static final String B3D_MOD_ID = "b3d-interop";
 }

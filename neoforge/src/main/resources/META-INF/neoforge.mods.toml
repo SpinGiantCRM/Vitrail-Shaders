@@ -65,7 +65,7 @@ side = "CLIENT"
 # always did. Ordered after it because what this mod does with it is register a provider into a
 # frame layer the other mod owns, and a layer that does not exist yet cannot be published into.
 [[dependencies.${mod_id}]]
-modId = "b3dinterop"
+modId = "b3d-interop"
 type = "optional"
 reason = "Lets this mod describe its finished frame to a consumer that asks for it. A capability, not a requirement."
 versionRange = "*"
