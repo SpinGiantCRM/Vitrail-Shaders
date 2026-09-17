@@ -48,6 +48,27 @@ dependencies {
 	compileOnly("net.caffeinemc:sodium-fabric:${project.sodium_version}") {
 		transitive = false
 	}
+
+	// The external frame API, which is a different kind of dependency from the two above and from
+	// Sodium: not required, not shipped with anything, and not resolvable from a repository either.
+	//
+	// The mod that publishes it publishes no artifact anywhere, so a coordinate would resolve for
+	// nobody, and the three shapes that exist all cost something this one does not. A local path
+	// behind a property leaves the integration out of what continuous integration compiles, which is
+	// exactly the code arriving ahead of what can be verified that CONTRIBUTING is most suspicious
+	// of. A separate artifact moves the bridge out of the engine and gives a release path of its own
+	// to a hundred lines of glue. Vendoring the API jar keeps one thing: the integration is compiled
+	// on every checkout, which is where a build that fails on a changed API belongs.
+	//
+	// It is compile only, so no class of it reaches this jar even though the file does, and the
+	// classes at runtime come from the other mod's own jar - which is absent on any stack that does
+	// not have it. That is also why the whole integration is behind a presence check and a class
+	// that is only loaded once the check has passed: a reference is free until the class holding it
+	// is initialised.
+	//
+	// Only the api package is in the vendored file. Its internal packages are not compiled against
+	// and are not here, because a build that can see them is a build that will eventually use them.
+	compileOnly files(rootProject.file("libs/b3d-interop-api-${project.b3d_interop_api_version}.jar"))
 }
 
 // The mod's logo, again, under a name the texture manager can reach: it is what Sodium is handed as
