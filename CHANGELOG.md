@@ -15,6 +15,13 @@ what the next one holds.
 
 ### Added
 
+- **Something outside the engine can produce the frame's upscaled picture.** Another mod can now ask
+to do the render scale's upscale itself: it is handed the finished world frame at the render size and
+the window-sized picture to write, and the engine's own upscale and sharpen stand down on the frames
+it handles. With nothing asking, nothing changes at all - the engine upscales its own frames exactly
+as before, with no extra image and no extra work. A component that declines a frame, is removed, or
+cannot produce one leaves that frame to the engine's own upscale.
+
 - **A frame that has been drawn can be offered to another mod that asks for it.** If the external
   frame API is installed, this engine describes the picture it has already drawn, the pack's
   converted depth, and - only while something is actually reading them - its motion vectors, as

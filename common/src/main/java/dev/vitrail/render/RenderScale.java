@@ -623,6 +623,21 @@ public final class RenderScale {
 
 		GpuDevice device = RenderSystem.getDevice();
 		GpuTextureView world = ((RenderTargetAccessor) scaled).vitrail$colorTextureView();
+
+		// The external seam, offered where this engine's own upscale would be drawn and instead of it
+		// when a provider takes the frame. Offered before the pipelines are fetched, so a provider can
+		// produce the picture on a frame this engine's own upscale could not compile for, which is the
+		// same frame the abandon path at the foot of this method gives up on.
+		//
+		// What orders a provider's work before the interface is what already orders the sharpen before
+		// it: the same encoder, the same window-sized destination and the same frame, one pass earlier
+		// than the interface's own. Nothing waits on the GPU here and nothing is idle: this returns as
+		// soon as the provider has recorded its work, exactly as the engine's own draw does.
+		if (ExternalUpscale.offer(encoder, device, world, fullColorView(main), scaled.width,
+				scaled.height, main.width, main.height)) {
+			return;
+		}
+
 		RenderPipeline easu = EASU.get(device);
 		RenderPipeline rcas = easu == null ? null : RCAS.get(device);
 		if (easu != null && rcas != null && upscaled != null) {
