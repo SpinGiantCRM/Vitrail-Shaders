@@ -13,6 +13,18 @@ what the next one holds.
 
 ## Unreleased
 
+### Added
+
+- **A frame that has been drawn can be offered to another mod that asks for it.** If the external
+  frame API is installed, this engine describes the picture it has already drawn, the pack's
+  converted depth, and - only while something is actually reading them - its motion vectors, as
+  borrowed resources that another mod reads where they already are. The camera matrices and the
+  conventions a reader needs to reproject a frame come with them, and the format of every resource is
+  the live one rather than an assumption. Nothing is copied, read back, duplicated or handed over: the
+  frame stays this engine's and is destroyed by the same paths as before, whoever is reading it. With
+  nothing asking, the export costs a descriptor per resource per frame and no GPU work at all, and the
+  motion vector pass stops drawing again as soon as nothing is reading it.
+
 ### Fixed
 
 - **SEUS PTGI HRR 3 is no longer set aside as soon as it loads.** Its anti-aliasing header carries

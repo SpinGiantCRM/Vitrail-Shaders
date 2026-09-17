@@ -59,3 +59,15 @@ reason = "Vitrail renders through Sodium, which owns the Vulkan command submissi
 versionRange = "[0.9,0.10)"
 ordering = "AFTER"
 side = "CLIENT"
+
+# The external frame API this mod can publish its frames into, when the player has it. Optional in
+# the sense that matters: nothing here needs it, and without it this mod renders exactly as it
+# always did. Ordered after it because what this mod does with it is register a provider into a
+# frame layer the other mod owns, and a layer that does not exist yet cannot be published into.
+[[dependencies.${mod_id}]]
+modId = "b3dinterop"
+type = "optional"
+reason = "Lets this mod describe its finished frame to a consumer that asks for it. A capability, not a requirement."
+versionRange = "*"
+ordering = "AFTER"
+side = "CLIENT"

@@ -1,6 +1,8 @@
 package dev.vitrail.platform;
 
+import dev.vitrail.b3d.B3DFrameExport;
 import dev.vitrail.cache.ModuleCache;
+import dev.vitrail.frame.FrameExport;
 import dev.vitrail.glsl.TranslationCache;
 import dev.vitrail.HostReport;
 import dev.vitrail.render.EntityDraw;
@@ -80,6 +82,15 @@ public final class EngineStages {
 		// The report of the pack goes with the reading of it, in PackChain, where which pack is
 		// being drawn is known.
 		PackChoice.load(Vitrail.platform().gameDirectory());
+
+		// Last, and only when the mod that owns the external frame API is here. The id is written
+		// out rather than read off the integration, because reading a constant there would be a
+		// reason for that class to be loaded - and it is the one class in this module whose types
+		// do not exist on a stack without that mod. Written this way, a stack without it runs this
+		// line, takes the other branch and never resolves a single name of the integration.
+		if (Vitrail.platform().isModLoaded(B3D_MOD_ID)) {
+			B3DFrameExport.attach();
+		}
 	}
 
 	/**
@@ -355,5 +366,15 @@ public final class EngineStages {
 		// doors, the atlases and the plain textures, and neither of them is the other's business.
 		PbrAtlases.close();
 		PbrTextures.close();
+
+		// The external frame export, when it was ever attached. Asked of the seam rather than of the
+		// integration, because asking the integration is what would load it - and on a stack without
+		// that mod nothing ever installed a sink, so this is false and no name of it is resolved.
+		if (FrameExport.installed()) {
+			B3DFrameExport.detach();
+		}
 	}
+
+	/** The mod whose frame API this engine can publish into, when the player has it. */
+	private static final String B3D_MOD_ID = "b3dinterop";
 }

@@ -34,6 +34,9 @@
 		"fabric-key-mapping-api-v1": "*",
 		"fabric-lifecycle-events-v1": "*"
 	},
+	"suggests": {
+		"b3dinterop": "*"
+	},
 	"custom": {
 		"sodium:options": {
 			"mixin.features.render.world.sky": false
