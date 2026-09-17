@@ -1,6 +1,8 @@
 package dev.vitrail.render;
 
 import dev.vitrail.dh.DhLods;
+import dev.vitrail.frame.FrameExport;
+import dev.vitrail.frame.FrameResources;
 import dev.vitrail.glsl.PackProgram;
 import dev.vitrail.pack.model.ProgramNames;
 import dev.vitrail.pack.model.RenderStage;
@@ -31,6 +33,7 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.systems.CommandEncoder;
 import com.mojang.blaze3d.systems.GpuDevice;
 import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.MappableRingBuffer;
@@ -137,6 +140,64 @@ public final class PackChain {
 		return chain == null || chain.targets == null
 				? null
 				: chain.targets.motionVectors().view();
+	}
+
+	/** The chain the frame is drawing from, or null while none is up or the pack has stopped. */
+	static PackChain current() {
+		return disabled ? null : active;
+	}
+
+	/**
+	 * This frame, as whoever is exporting frames sees it, or null when there is no frame of ours to
+	 * export.
+	 * <p>
+	 * The chain is what makes it ours: with no pack drawing there is no converted depth copy, no
+	 * vectors and no matrices held for a frame the chain did not run, and the colour left in the
+	 * game's target is the game's own picture rather than this engine's. So this answers null and the
+	 * seam stands down, which is the one thing that keeps a stack with no pack out of an export that
+	 * would otherwise describe somebody else's frame.
+	 * <p>
+	 * <strong>Everything is looked up here and nothing is kept.</strong> Each of these views is
+	 * recreated by a resize, a render scale engagement or a pack reload, and the engine's own note on
+	 * the danger is blunt: a view held across a resize is a use after free rather than an exception.
+	 * The reader is given them for the length of one call and {@link FrameResources} says so from its
+	 * side.
+	 * <p>
+	 * <strong>The depth exported is the chain's converted copy and not the device image.</strong> They
+	 * are different volumes - the copy is forward over 0..1, which is what a pack reads depth in, and
+	 * the device image is the reversed volume it rasterises into - and the window-sized device image
+	 * is destroyed by the very clear this export runs ahead of. The copy is the one this frame's own
+	 * vector pass reads, so it is also the one whose convention is already written down.
+	 *
+	 * @param main  the game's render target, holding the window-sized set by the time this runs
+	 * @param index which exported frame this is, counting from one
+	 */
+	static FrameResources exportFrame(final RenderTarget main, final long index) {
+		PackChain chain = current();
+
+		if (chain == null || main == null) {
+			return null;
+		}
+
+		GpuTexture colour = main.getColorTexture();
+		GpuTextureView colourView = main.getColorTextureView();
+
+		if (colour == null || colourView == null) {
+			return null;
+		}
+
+		MotionVectors vectors = chain.targets.motionVectors();
+		ViewMatrices view = chain.values.view();
+		WorldState world = chain.values.world();
+
+		// The rendered pair and never the published one: the matrices a pack reads have been
+		// converted to OpenGL's volume, and pairing one of those with one of these reconstructs a
+		// position that is wrong by more the further away it is. MotionVectors carries the long
+		// version of that argument where it does the same thing for its own reprojection.
+		return new FrameResources(colour, colourView, chain.targets.depth().opaque(),
+				vectors.view(), vectors.image(), view.gbufferModelView(),
+				view.gbufferPreviousModelView(), view.rendered(), view.previousRendered(),
+				world.cameraPosition(), world.previousCameraPosition(), view.near(), view.far(), index);
 	}
 
 	/**
@@ -2269,7 +2330,14 @@ public final class PackChain {
 		// The gate is asked BEFORE anything is built for the call: an encoder made in the argument
 		// list is two allocations a frame for a player who never turns any of this on.
 		MotionVectors vectors = this.targets.motionVectors();
-		if (RenderScale.upscaling() && TemporalAccumulation.wanted()) {
+		// Two independent reasons to pay for this pass, and they answer one question between them:
+		// does anything read this frame's vectors? The engine's own temporal fold is one, and it is
+		// off by default and does nothing at all at a render scale of a hundred percent; a consumer
+		// outside the engine is the other, through a seam that does not know what the consumer is.
+		// Neither reason is written in terms of what wants the picture, which is the point: an
+		// upscaler and a shader engine's own fold arrive here through the same boolean.
+		boolean foldWanted = RenderScale.upscaling() && TemporalAccumulation.wanted();
+		if (foldWanted || FrameExport.wantsMotionVectors()) {
 			vectors.draw(device.createCommandEncoder(), device, this.quad,
 					this.targets.depth().opaque(), ready.main().width, ready.main().height,
 					this.values.view(), this.values.world());

@@ -21,6 +21,7 @@ import com.mojang.blaze3d.systems.GpuDevice;
 import com.mojang.blaze3d.systems.RenderPass;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.FilterMode;
+import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import net.minecraft.client.renderer.BindGroupLayouts;
@@ -226,6 +227,20 @@ final class MotionVectors {
 	/** This frame's vectors, or null while nothing has drawn them. */
 	GpuTextureView view() {
 		return this.drawn ? this.vectors.view() : null;
+	}
+
+	/**
+	 * The image behind them, or null while none is allocated.
+	 * <p>
+	 * A different question from {@link #view}, and the difference is the whole reason both exist:
+	 * the view answers whether <em>this frame</em> wrote the vectors, and the image answers whether
+	 * there is anything to hold a descriptor for. {@link #standDown} gives the image back on every
+	 * frame nothing reads it, so an exporter that only watched the view could not tell a frame with
+	 * no vectors from a frame whose vectors no longer exist - and a descriptor for the second is a
+	 * handle into freed memory.
+	 */
+	GpuTexture image() {
+		return this.vectors == null ? null : this.vectors.texture();
 	}
 
 	/**

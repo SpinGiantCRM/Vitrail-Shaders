@@ -1,6 +1,7 @@
 package dev.vitrail.mixin;
 
 import dev.vitrail.render.RenderScale;
+import dev.vitrail.render.WorldFrameExport;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
@@ -83,6 +84,12 @@ public abstract class GameRendererScaleMixin {
 			Operation<Void> original) {
 		RenderTarget main = mainRenderTarget();
 		RenderScale.endWorld(main, encoder);
+		// After the upscale and the restore, before the game's own clear: the frame's picture is
+		// finished, the window-sized set is back in the target, no pass is open and the interface is
+		// still not drawn, so this is the last moment the frame can be described as a finished frame
+		// with no UI in it. Before the original call rather than after it because the clear that
+		// follows destroys the window-sized depth - the seam is a deadline and not a landmark.
+		WorldFrameExport.publish(main);
 		original.call(encoder, main == null ? depth : main.getDepthTexture(), clearDepth);
 	}
 }
