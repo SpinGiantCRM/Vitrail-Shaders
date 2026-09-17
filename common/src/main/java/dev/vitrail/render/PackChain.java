@@ -2,6 +2,7 @@ package dev.vitrail.render;
 
 import dev.vitrail.dh.DhLods;
 import dev.vitrail.frame.FrameExport;
+import dev.vitrail.frame.EngineImage;
 import dev.vitrail.frame.FrameResources;
 import dev.vitrail.glsl.PackProgram;
 import dev.vitrail.pack.model.ProgramNames;
@@ -179,23 +180,28 @@ public final class PackChain {
 			return null;
 		}
 
-		GpuTexture colour = main.getColorTexture();
-		GpuTextureView colourView = main.getColorTextureView();
+		// The one place the engine's own objects are converted to the port the description path
+		// speaks: everything after this line is a handle, a format and an extent, which is what lets
+		// the rules about replacing and invalidating them be exercised without a device.
+		EngineImage colour = EngineImage.of(main.getColorTexture(), main.getColorTextureView());
 
-		if (colour == null || colourView == null) {
+		if (colour == null) {
 			return null;
 		}
 
 		MotionVectors vectors = chain.targets.motionVectors();
 		ViewMatrices view = chain.values.view();
 		WorldState world = chain.values.world();
+		GpuTextureView depthView = chain.targets.depth().opaque();
+		GpuTextureView vectorsView = vectors.view();
 
 		// The rendered pair and never the published one: the matrices a pack reads have been
 		// converted to OpenGL's volume, and pairing one of those with one of these reconstructs a
 		// position that is wrong by more the further away it is. MotionVectors carries the long
 		// version of that argument where it does the same thing for its own reprojection.
-		return new FrameResources(colour, colourView, chain.targets.depth().opaque(),
-				vectors.view(), vectors.image(), view.gbufferModelView(),
+		return new FrameResources(colour, EngineImage.of(depthView == null ? null : depthView.texture(), depthView),
+				EngineImage.of(vectors.image(), vectorsView), EngineImage.of(vectors.image(), null),
+				view.gbufferModelView(),
 				view.gbufferPreviousModelView(), view.rendered(), view.previousRendered(),
 				world.cameraPosition(), world.previousCameraPosition(), view.near(), view.far(), index);
 	}

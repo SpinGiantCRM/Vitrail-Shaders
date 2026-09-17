@@ -7,10 +7,8 @@ import dev.vitrail.frame.FrameResources;
 import b3dinterop.api.backend.GraphicsApi;
 import b3dinterop.api.frame.FrameColorInfo;
 import b3dinterop.api.frame.FrameDemand;
-import b3dinterop.api.frame.FrameDemandRegistration;
 import b3dinterop.api.frame.FrameExchange;
 import b3dinterop.api.frame.FrameId;
-import b3dinterop.api.frame.FrameRequirements;
 import b3dinterop.api.frame.FrameSemantic;
 import b3dinterop.api.frame.FrameSession;
 import b3dinterop.api.frame.FrameSnapshot;
@@ -33,10 +31,7 @@ import b3dinterop.api.sync.SyncPrimitive;
 
 import com.mojang.blaze3d.GpuDeviceLossException;
 import com.mojang.blaze3d.GpuFormat;
-import com.mojang.blaze3d.textures.GpuTexture;
-import com.mojang.blaze3d.textures.GpuTextureView;
-import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
-import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
+import dev.vitrail.frame.EngineImage;
 import org.joml.Vector3dc;
 
 import java.util.LinkedHashSet;
@@ -89,17 +84,6 @@ public final class B3DFrameExport {
 	 */
 	public static final String B3D_MOD_ID = "b3d-interop";
 
-	/**
-	 * A demand this mod registers for itself, for the runtime validation: {@code <semantic>} or
-	 * {@code <semantic>:<frames>}, where the second form withdraws the demand after that many
-	 * exported frames. Absent by default, so a normal session registers nothing and consumes
-	 * nothing.
-	 */
-	public static final String DEMAND_PROPERTY = "vitrail.b3d.demand";
-
-	/** Quieter than every frame: how often the self-test demand repeats its answer. */
-	private static final long SELF_TEST_PERIOD = 600L;
-
 	private static final String PROVIDER_ID = "vitrail";
 	private static final String NAMESPACE = "vitrail";
 
@@ -126,8 +110,6 @@ public final class B3DFrameExport {
 		new Slot(ResourceKey.of(NAMESPACE, "motion_vectors"), FrameSemantic.MOTION_VECTORS);
 
 	private static FrameSession session;
-	private static FrameDemandRegistration selfTest;
-	private static long selfTestWithdrawAt;
 	private static long exported;
 	private static long failures;
 	private static boolean motionVectorsDrawn;
@@ -151,8 +133,7 @@ public final class B3DFrameExport {
 	}
 
 	/**
-	 * Attaches the export: a frame session, the sink the engine calls, and the self-test demand the
-	 * property asks for.
+	 * Attaches the export: a frame session and the sink the engine calls.
 	 * <p>
 	 * Idempotent, because both loaders reach their client setup exactly once but a caller cannot
 	 * tell that from here, and a second attach would leave a session nobody closes.
@@ -166,7 +147,6 @@ public final class B3DFrameExport {
 		session.advertises(Set.of(FrameSemantic.SCENE_COLOR, FrameSemantic.DEPTH,
 			FrameSemantic.MOTION_VECTORS));
 		FrameExport.install(B3DFrameExport::onFrame);
-		registerSelfTest();
 
 		Vitrail.logger().info("Publishing this engine's frames to {} as {}: scene colour, depth, and "
 			+ "motion vectors when a consumer asks for them", B3D_MOD_ID, PROVIDER_ID);
@@ -174,8 +154,6 @@ public final class B3DFrameExport {
 
 	/** Detaches the export, closing everything it published. Idempotent. */
 	public static synchronized void detach() {
-		closeSelfTest();
-
 		if (session == null) {
 			FrameExport.uninstall();
 
@@ -224,7 +202,7 @@ public final class B3DFrameExport {
 		}
 	}
 
-	private static void contribute(final FrameResources frame) {
+	private static boolean contribute(final FrameResources frame) {
 		final FrameDemand demand = FrameExchange.demand();
 
 		// The engine reads this where the motion vector pass would be drawn, which is before this
@@ -236,28 +214,32 @@ public final class B3DFrameExport {
 		final Optional<FrameSnapshot> open = FrameExchange.currentSnapshot();
 
 		if (open.isEmpty()) {
-			return;
+			return false;
 		}
 
 		final FrameSnapshot snapshot = open.get();
 		final FrameId frameId = snapshot.frameId();
 
 		exported = frame.index();
-		withdrawSelfTestIfDue();
 
 		final boolean colourClaimed =
-			contributeImage(snapshot, frameId, SCENE_COLOUR, frame.sceneColour(), frame.sceneColourView());
+			contributeImage(snapshot, frameId, SCENE_COLOUR, frame.sceneColour());
 		boolean depthClaimed = false;
 
 		if (frame.hasDepth()) {
-			depthClaimed = contributeImage(snapshot, frameId, DEPTH, frame.depth().texture(), frame.depth());
+			depthClaimed = contributeImage(snapshot, frameId, DEPTH, frame.depth());
+		} else {
+			// This frame carries no depth copy at all, which is a frame whose pack did not fill it - the
+			// title screen, a world just left, or a copy the allocation refused. The publication ends
+			// rather than standing over an image a consumer cannot trust: the last frame's depth read as
+			// this frame's is worse than no depth at all, because nothing downstream can tell.
+			DEPTH.close();
 		}
 
 		boolean vectorsClaimed = false;
 
 		if (frame.hasMotionVectors()) {
-			vectorsClaimed = contributeImage(snapshot, frameId, MOTION_VECTORS, frame.motionVectorImage(),
-				frame.motionVectors());
+			vectorsClaimed = contributeImage(snapshot, frameId, MOTION_VECTORS, frame.motionVectors());
 		} else if (!frame.hasMotionVectorImage()) {
 			// The pass gave its image back, which it does on every frame nothing reads it. The
 			// publication ends rather than standing over an image that no longer exists: this is the
@@ -266,15 +248,15 @@ public final class B3DFrameExport {
 			MOTION_VECTORS.close();
 		}
 
-		final boolean contributed = colourClaimed || depthClaimed || vectorsClaimed;
+		// Said from the frame that drew rather than from the demand: the demand says the pass was
+		// armed, and this says it ran.
+		sayDrawn(frame.hasMotionVectors());
 
-		if (!contributed) {
+		if (!colourClaimed && !depthClaimed && !vectorsClaimed) {
 			// Nothing of this frame is this engine's to describe - no pack is drawing it, or the
 			// backend is not Vulkan - so its camera state is not published either. A frame with
 			// metadata and no resources would be a description of somebody else's frame.
-			reportSelfTest(frame, snapshot, false, false);
-
-			return;
+			return false;
 		}
 
 		// Declared only for what this class contributed, because a frame carries one convention and
@@ -295,7 +277,7 @@ public final class B3DFrameExport {
 			session.color(FrameColorInfo.unknown(REASON_COLOUR));
 		}
 
-		reportSelfTest(frame, snapshot, colourClaimed, depthClaimed);
+		return true;
 	}
 
 	/**
@@ -311,18 +293,16 @@ public final class B3DFrameExport {
 		final FrameSnapshot snapshot,
 		final FrameId frameId,
 		final Slot slot,
-		final GpuTexture texture,
-		final GpuTextureView view
+		final EngineImage port
 	) {
 		if (!claim(snapshot, slot.semantic)) {
 			return false;
 		}
 
-		final long image = imageHandle(texture);
-		final long imageView = viewHandle(view);
+		final long image = port.nativeImage();
 
-		if (image == 0L) {
-			// Not a Vulkan texture, which is the whole of what this backend can describe. Said once
+		if (!port.isNative()) {
+			// Not a Vulkan image, which is the whole of what this backend can describe. Said once
 			// and not per frame; the engine's own picture is unaffected either way.
 			notVulkan(slot.semantic);
 
@@ -331,17 +311,27 @@ public final class B3DFrameExport {
 
 		final boolean first = slot.image == 0L;
 		final boolean replaced = slot.image != 0L && slot.image != image;
-		final int width = texture.getWidth(0);
-		final int height = texture.getHeight(0);
+		final int width = port.width();
+		final int height = port.height();
 		final boolean resized = slot.width != 0 && (slot.width != width || slot.height != height);
 
-		slot.publish(descriptor(texture, image, imageView), image, imageView, width, height);
+		slot.publish(descriptor(port), port);
 		session.resource(slot.semantic, slot.key);
 
 		if (resized) {
-			reset(HistoryResetReason.RESOLUTION_CHANGE, "the " + slot.semantic.id()
-				+ " resource is now " + width + "x" + height + ", so a history accumulated at the old size "
-				+ "is not a continuation of anything");
+			// Unless the frame itself already says so. A resize is visible twice over: the exchange
+			// sees the frame's own size at its boundary, and this adapter sees the resource's extent
+			// change underneath it. Both are describing one transition, and asking for a second reset
+			// would invalidate a history that is already empty - which a temporal consumer would report
+			// as two resets for one resize. On a frame whose boundary carried no size, or carried the
+			// wrong one, the exchange has said nothing and this is the only report of it.
+			if (!snapshot.history().reset()
+				|| snapshot.history().reason().orElse(null) != HistoryResetReason.RESOLUTION_CHANGE
+				|| !snapshot.history().sinceFrame().equals(frameId)) {
+				reset(HistoryResetReason.RESOLUTION_CHANGE, "the " + slot.semantic.id()
+					+ " resource is now " + width + "x" + height + ", so a history accumulated at the old "
+					+ "size is not a continuation of anything");
+			}
 		} else if (replaced) {
 			reset(HistoryResetReason.RESOURCE_RECREATION, "the " + slot.semantic.id()
 				+ " resource was recreated at " + width + "x" + height + " (new native handle 0x"
@@ -351,14 +341,12 @@ public final class B3DFrameExport {
 		// The live format is named here rather than assumed from a constant: the only honest source for
 		// "what format is this image?" is the image, and this line is the one place that says it.
 		if (first) {
-			Vitrail.logger().info("Published the {} resource: {}x{}, live format {}, native handle "
-				+ "0x{}, view 0x{}, publication generation {}", slot.semantic.id(), width, height,
-				liveFormat(texture), Long.toHexString(image), Long.toHexString(imageView),
+			Vitrail.logger().info("Published the {} resource: {}x{}, live format {}, generation {}",
+				slot.semantic.id(), width, height, liveFormat(port),
 				slot.publication == null ? 0L : slot.publication.generation());
 		} else if (replaced || resized) {
-			Vitrail.logger().info("Replaced the exported {} resource: {}x{}, live format {}, native "
-				+ "handle 0x{}, publication generation {}", slot.semantic.id(), width, height,
-				liveFormat(texture), Long.toHexString(image),
+			Vitrail.logger().info("Replaced the exported {} resource: {}x{}, live format {}, "
+				+ "generation {}", slot.semantic.id(), width, height, liveFormat(port),
 				slot.publication == null ? 0L : slot.publication.generation());
 		}
 
@@ -397,15 +385,11 @@ public final class B3DFrameExport {
 	}
 
 	/** Declares the resource state no consumer may assume, with the reason it is not stated. */
-	private static ExternalImage descriptor(
-		final GpuTexture texture,
-		final long image,
-		final long imageView
-	) {
-		final GpuFormat format = texture.getFormat();
+	private static ExternalImage descriptor(final EngineImage port) {
+		final GpuFormat format = port.format();
 		final TexelFormat texel = texelFormat(format);
-		final ExternalImage.Builder descriptor = ExternalImage.builder(GraphicsApi.VULKAN, image)
-			.view(imageView)
+		final ExternalImage.Builder descriptor = ExternalImage.builder(GraphicsApi.VULKAN, port.nativeImage())
+			.view(port.nativeView())
 			.format(texel);
 
 		if (texel == TexelFormat.UNKNOWN) {
@@ -414,7 +398,7 @@ public final class B3DFrameExport {
 			descriptor.nativeFormat(format.ordinal());
 		}
 
-		return descriptor.extent(texture.getWidth(0), texture.getHeight(0))
+		return descriptor.extent(port.width(), port.height())
 			.aspect(aspectOf(texel))
 			.state(ResourceState.UNDEFINED)
 			// Every texture this engine owns is used by the queue family the frame is drawn on, and
@@ -549,92 +533,6 @@ public final class B3DFrameExport {
 			: "The motion vector pass has stopped drawing: nothing is reading this frame's vectors");
 	}
 
-	/** Registers the demand the self-test property asks for, if it asks for one. */
-	private static void registerSelfTest() {
-		final String asked = System.getProperty(DEMAND_PROPERTY, "").trim();
-
-		if (asked.isEmpty()) {
-			return;
-		}
-
-		final int separator = asked.indexOf(':');
-		final String name = separator < 0 ? asked : asked.substring(0, separator);
-		final Set<FrameSemantic> required = new LinkedHashSet<>();
-
-		if (name.equals("motion_vectors")) {
-			required.add(FrameSemantic.MOTION_VECTORS);
-		} else if (name.equals("colour_and_depth") || name.equals("colour-and-depth")) {
-			required.add(FrameSemantic.SCENE_COLOR);
-			required.add(FrameSemantic.DEPTH);
-		} else {
-			Vitrail.logger().warn("{} names a semantic this test does not know: '{}'", DEMAND_PROPERTY, name);
-
-			return;
-		}
-
-		selfTest = FrameExchange.registerDemand("vitrail:selftest", FrameRequirements.requiring(
-			required.toArray(new FrameSemantic[0])));
-
-		if (separator >= 0) {
-			try {
-				selfTestWithdrawAt = exported + Long.parseLong(asked.substring(separator + 1));
-			} catch (NumberFormatException e) {
-				Vitrail.logger().warn("{} names a frame count that is not a number: '{}'", DEMAND_PROPERTY,
-					asked);
-
-				return;
-			}
-		}
-
-		Vitrail.logger().info("Registered a test demand for {}; it withdraws after {} exported frame(s)",
-			required, selfTestWithdrawAt == 0L ? "every" : Long.toString(selfTestWithdrawAt));
-	}
-
-	/** Withdraws the test demand once the frames it asked for have been exported. */
-	private static void withdrawSelfTestIfDue() {
-		if (selfTest != null && selfTestWithdrawAt != 0L && exported >= selfTestWithdrawAt) {
-			Vitrail.logger().info("Withdrawing the test demand after {} exported frames; the engine "
-				+ "should stop drawing motion vectors", exported);
-			closeSelfTest();
-		}
-	}
-
-	private static void closeSelfTest() {
-		if (selfTest != null) {
-			selfTest.close();
-			selfTest = null;
-		}
-	}
-
-	/** The test demand's own view of the frame, bounded so normal play is never a log a frame. */
-	private static void reportSelfTest(
-		final FrameResources frame,
-		final FrameSnapshot snapshot,
-		final boolean colour,
-		final boolean depth
-	) {
-		sayDrawn(frame.hasMotionVectors());
-
-		if (selfTest == null || (frame.index() > 5L && frame.index() % SELF_TEST_PERIOD != 0L)) {
-			return;
-		}
-
-		Vitrail.logger().info("Test demand on exported frame {}: {}; this engine contributed colour {}, "
-			+ "depth {}, vectors {}; history {}", frame.index(),
-			selfTest.requirements().check(snapshot.semantics()).describe(), colour, depth,
-			frame.hasMotionVectors(), snapshot.history().describe());
-	}
-
-	/** The Vulkan image behind an engine texture, or {@code 0} when this is not a Vulkan texture. */
-	private static long imageHandle(final GpuTexture texture) {
-		return texture instanceof VulkanGpuTexture vulkan ? vulkan.vkImage() : 0L;
-	}
-
-	/** The Vulkan view handle, or {@code 0} when there is none or it is not a Vulkan view. */
-	private static long viewHandle(final GpuTextureView view) {
-		return view instanceof VulkanGpuTextureView vulkan ? vulkan.vkImageView() : 0L;
-	}
-
 	/**
 	 * The neutral format for an engine format, by name: the two enums spell the same formats the
 	 * same way, and a name the neutral enum does not know is reported as unknown, which forces the
@@ -650,9 +548,9 @@ public final class B3DFrameExport {
 		return TexelFormat.UNKNOWN;
 	}
 
-	/** The live format of a texture, named the way the descriptor names it. */
-	private static String liveFormat(final GpuTexture texture) {
-		final GpuFormat format = texture.getFormat();
+	/** The live format of an image, named the way the descriptor names it. */
+	private static String liveFormat(final EngineImage port) {
+		final GpuFormat format = port.format();
 		final TexelFormat texel = texelFormat(format);
 
 		return texel == TexelFormat.UNKNOWN
@@ -680,30 +578,47 @@ public final class B3DFrameExport {
 		private long view;
 		private int width;
 		private int height;
+		private GpuFormat format;
 
 		private Slot(final ResourceKey key, final FrameSemantic semantic) {
 			this.key = key;
 			this.semantic = semantic;
 		}
 
-		/** Publishes the first descriptor or replaces the one standing, and records the handles. */
-		private void publish(
-			final ExternalImage descriptor,
-			final long newImage,
-			final long newView,
-			final int newWidth,
-			final int newHeight
-		) {
+		/**
+		 * Publishes the first descriptor, or replaces the one standing when the resource really changed.
+		 * <p>
+		 * <strong>Nothing is replaced on a frame the resource did not change on, and that is not an
+		 * optimisation.</strong> A replacement is a statement that the resource under the key is a
+		 * different resource: the exchange bumps the publication's generation, invalidates every handle a
+		 * consumer acquired from the previous one, and records a producer error for replacing a resource
+		 * it had borrowed out. Doing that once a frame would mean a consumer's handle is dead by the next
+		 * frame - which is the opposite of what a {\code BORROWED_PERSISTENT} descriptor with an
+		 * {\code UNTIL_INVALIDATED} lifetime promises - and would fill the diagnostics with a fault this
+		 * engine caused by merely drawing. The four things compared here are the whole of what can
+		 * change about an image the engine keeps in place: which image it is, its view, its extent and
+		 * its format.
+		 */
+		private void publish(final ExternalImage descriptor, final EngineImage port) {
+			final boolean changed = this.image != port.nativeImage()
+				|| this.view != port.nativeView()
+				|| this.width != port.width()
+				|| this.height != port.height()
+				|| this.format != port.format();
+
 			if (this.publication != null && this.publication.isOpen()) {
-				this.publication.replace(descriptor);
+				if (changed) {
+					this.publication.replace(descriptor);
+				}
 			} else {
 				this.publication = ExternalResourceExchange.publish(this.key, PROVIDER_ID, descriptor);
 			}
 
-			this.image = newImage;
-			this.view = newView;
-			this.width = newWidth;
-			this.height = newHeight;
+			this.image = port.nativeImage();
+			this.view = port.nativeView();
+			this.width = port.width();
+			this.height = port.height();
+			this.format = port.format();
 		}
 
 		/** Ends the publication, which invalidates every consumer handle onto it. */
@@ -721,6 +636,7 @@ public final class B3DFrameExport {
 			this.view = 0L;
 			this.width = 0;
 			this.height = 0;
+			this.format = null;
 
 			return true;
 		}

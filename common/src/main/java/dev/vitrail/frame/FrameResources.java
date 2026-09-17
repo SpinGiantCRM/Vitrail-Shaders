@@ -1,18 +1,19 @@
 package dev.vitrail.frame;
 
-import com.mojang.blaze3d.textures.GpuTexture;
-import com.mojang.blaze3d.textures.GpuTextureView;
 import org.joml.Matrix4fc;
 import org.joml.Vector3dc;
 
 /**
  * One rendered frame, as the engine hands it to whatever is exporting frames.
  * <p>
- * <strong>Nothing here is owned or kept by the reader.</strong> Every object is one the engine
- * already had and will go on owning: the textures are recreated by a resize, a pack reload or a
+ * <strong>Nothing here is owned or kept by the reader.</strong> Every resource is one the engine
+ * already had and will go on owning: the images are recreated by a resize, a pack reload or a
  * render scale engagement, and a holder that keeps one across any of those has a use after free
- * rather than an exception. The reference is valid for the call it arrives in, which is the whole
- * of the contract, and {@link FrameExport.Sink} says the same thing from the other side.
+ * rather than an exception. What arrives here is {@link EngineImage}, which is a handle and a
+ * format rather than the engine's own view, so a stale one is a number that can be compared and
+ * refused rather than a reference into freed memory. The value is valid for the call it arrives in,
+ * which is the whole of the contract, and {@link FrameExport.Sink} says the same thing from the
+ * other side.
  * <p>
  * <strong>An absent resource is absent, not empty.</strong> {@code depth} is null on a frame the
  * pack did not fill its converted copy, and {@code motionVectors} is null on a frame the pass did
@@ -22,8 +23,8 @@ import org.joml.Vector3dc;
  * <p>
  * <strong>{@code motionVectorImage} is not a fourth resource.</strong> It is the image behind
  * {@code motionVectors}, and it is carried separately because the two answer different questions:
- * the view says whether this frame's vectors were written, and the image says whether there is
- * anything allocated at all. {@code MotionVectors} frees its image on any frame nothing reads it,
+ * the view handle inside it says whether this frame's vectors were written, and the record itself
+ * says whether there is anything allocated at all. {@code MotionVectors} frees its image on any frame nothing reads it,
  * so between two frames of demand the image goes out of existence - and a consumer holding a
  * descriptor for it must be told that happened rather than discovering it. A null view with a
  * non-null image is the one frame after an allocation where the pass legitimately drew nothing.
@@ -42,7 +43,6 @@ import org.joml.Vector3dc;
  * reprojection needs - has it here to the bit.
  *
  * @param sceneColour            the frame's finished world colour, HUD-less, at the window size
- * @param sceneColourView        the view onto it, or null when the target has none
  * @param depth                  the pack's converted depth copy, or null when there is none
  * @param motionVectors          this frame's vectors, or null when the pass did not draw them
  * @param motionVectorImage      the image behind them, or null when none is allocated
@@ -57,11 +57,10 @@ import org.joml.Vector3dc;
  * @param index                  which exported frame this is, counting from one for the session
  */
 public record FrameResources(
-		GpuTexture sceneColour,
-		GpuTextureView sceneColourView,
-		GpuTextureView depth,
-		GpuTextureView motionVectors,
-		GpuTexture motionVectorImage,
+		EngineImage sceneColour,
+		EngineImage depth,
+		EngineImage motionVectors,
+		EngineImage motionVectorImage,
 		Matrix4fc view,
 		Matrix4fc previousView,
 		Matrix4fc projection,
@@ -115,11 +114,11 @@ public record FrameResources(
 
 	/** The width of the frame's colour, in pixels. */
 	public int width() {
-		return this.sceneColour.getWidth(0);
+		return this.sceneColour.width();
 	}
 
 	/** The height of the frame's colour, in pixels. */
 	public int height() {
-		return this.sceneColour.getHeight(0);
+		return this.sceneColour.height();
 	}
 }
