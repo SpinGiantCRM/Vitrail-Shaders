@@ -32,6 +32,7 @@ import b3dinterop.api.sync.SyncPrimitive;
 import com.mojang.blaze3d.GpuDeviceLossException;
 import com.mojang.blaze3d.GpuFormat;
 import dev.vitrail.frame.EngineImage;
+import dev.vitrail.frame.EngineImageState;
 import org.joml.Vector3dc;
 
 import java.util.LinkedHashSet;
@@ -97,14 +98,20 @@ public final class B3DFrameExport {
 	private static final String NAMESPACE = "vitrail";
 
 	private static final String REASON_ORDERED =
-		"the engine's own work for this frame is recorded into the frame's command buffer and "
-			+ "submitted at its end; a consumer that opens its work after the frame boundary, on the "
-			+ "same queue family, is ordered behind it";
+		"this frame's writes are recorded into the engine's own command buffer and submitted at the "
+			+ "frame's end, and a consumer of the external frame API records on that same queue - its "
+			+ "submission is behind this engine's in queue order and against the same queue family. That "
+			+ "order is an execution dependency and not a memory one: the barrier a consumer records "
+			+ "with the state published here is what makes these writes visible to its reads";
 	private static final String REASON_RELEASE =
 		"this engine cannot name a consumer's completion primitive; the consumer states its own";
 	private static final String REASON_LAYOUT =
-		"this engine tracks no image layouts - every texture it owns lives in the general layout for "
-			+ "its whole life, so the descriptor claims nothing and a consumer transitions what it uses";
+		"every image this engine owns is created undefined and transitioned once to the general "
+			+ "layout, and nothing in the game transitions it again: dynamic rendering names the general "
+			+ "layout for every colour and depth attachment, so does every descriptor binding, and the "
+			+ "only two transitions in the whole engine are that one and the swapchain's. So the layout "
+			+ "is stated rather than guessed, and the stage and access masks published with it are the "
+			+ "widest legal scope for it - which is the safe direction for a barrier's source scope";
 	private static final String REASON_COLOUR =
 		"neither this engine nor the game knows the primaries or the transfer function of the frame "
 			+ "it rasterises into; the picture is past whatever tone mapping the pack does and no paper "
@@ -135,6 +142,12 @@ public final class B3DFrameExport {
 	 * once a frame.
 	 */
 	private static final Set<FrameSemantic> stoodDown = new LinkedHashSet<>();
+
+	/**
+	 * Semantics whose image was described as undefined because its state could not be read, once
+	 * each. Same reason as {@link #stoodDown}: it is a property of the session, not of a frame.
+	 */
+	private static final Set<FrameSemantic> unreported = new LinkedHashSet<>();
 
 	private B3DFrameExport() {
 	}
@@ -185,6 +198,7 @@ public final class B3DFrameExport {
 		planesAbsentSaid = false;
 		lastDemandVersion = -1L;
 		stoodDown.clear();
+		unreported.clear();
 
 		Vitrail.logger().info("Stopped publishing this engine's frames after {} exported frame(s)",
 			exported);
@@ -337,6 +351,16 @@ public final class B3DFrameExport {
 			return false;
 		}
 
+		if (!port.isStateStated() && unreported.add(slot.semantic)) {
+			// A native image the engine could not say the state of, which the descriptor then
+			// publishes as undefined - an honest "nobody can say where this is" rather than a layout
+			// nothing supports. Said once per semantic, because it is a state of the session and not
+			// a thing that happens per frame.
+			Vitrail.logger().info("The {} resource is published as undefined: this engine could not "
+					+ "read the state of the image it is describing ({}).", slot.semantic.id(),
+				REASON_LAYOUT);
+		}
+
 		final boolean first = slot.image == 0L;
 		final boolean replaced = slot.image != 0L && slot.image != image;
 		final int width = port.width();
@@ -369,12 +393,12 @@ public final class B3DFrameExport {
 		// The live format is named here rather than assumed from a constant: the only honest source for
 		// "what format is this image?" is the image, and this line is the one place that says it.
 		if (first) {
-			Vitrail.logger().info("Published the {} resource: {}x{}, live format {}, generation {}",
-				slot.semantic.id(), width, height, liveFormat(port),
+			Vitrail.logger().info("Published the {} resource: {}x{}, live format {}, {}, generation {}",
+				slot.semantic.id(), width, height, liveFormat(port), state(port),
 				slot.publication == null ? 0L : slot.publication.generation());
 		} else if (replaced || resized) {
-			Vitrail.logger().info("Replaced the exported {} resource: {}x{}, live format {}, "
-				+ "generation {}", slot.semantic.id(), width, height, liveFormat(port),
+			Vitrail.logger().info("Replaced the exported {} resource: {}x{}, live format {}, {}, "
+				+ "generation {}", slot.semantic.id(), width, height, liveFormat(port), state(port),
 				slot.publication == null ? 0L : slot.publication.generation());
 		}
 
@@ -412,7 +436,21 @@ public final class B3DFrameExport {
 		}
 	}
 
-	/** Declares the resource state no consumer may assume, with the reason it is not stated. */
+	/**
+	 * Declares where the image is, in both the API's neutral vocabulary and Vulkan's.
+	 * <p>
+	 * The two halves are built from one answer rather than filled in separately, so they cannot
+	 * contradict each other: the neutral state comes from the engine's own answer for this image, and
+	 * Vulkan's precise state is the canonical state for that neutral one, which is also what makes
+	 * the stage and access masks the widest legal scope rather than a guess at this frame's last
+	 * write.
+	 * <p>
+	 * A native image whose state the engine could not read is described as undefined, which is the
+	 * honest answer to "where is this image" when nobody can say, and is what a consumer must treat
+	 * as "the contents do not survive". That is not a case the engine reaches on Vulkan - the state
+	 * is read from the same device that produced the handle - and it is kept because a descriptor
+	 * that claims nothing is better than one that claims the wrong thing.
+	 */
 	private static ExternalImage descriptor(final EngineImage port) {
 		final GpuFormat format = port.format();
 		final TexelFormat texel = texelFormat(format);
@@ -426,19 +464,38 @@ public final class B3DFrameExport {
 			descriptor.nativeFormat(format.ordinal());
 		}
 
+		final boolean stated = port.isStateStated();
+		final ResourceState state = stated ? resourceState(port.state()) : ResourceState.UNDEFINED;
+		// The family is part of the state and not a separate assumption: an image's owner is the
+		// family of the device that created it, which is the one this frame read. It is not the
+		// constant nought - that is a property of this card's family layout, not of the engine - and
+		// it says nothing about a consumer's queue, so one that submits elsewhere owns the transfer.
+		final int family = stated ? port.state().queueFamily() : -1;
+
 		return descriptor.extent(port.width(), port.height())
 			.aspect(aspectOf(texel))
-			.state(ResourceState.UNDEFINED)
-			// Every texture this engine owns is used by the queue family the frame is drawn on, and
-			// it is the family the game's own device was created with. It says nothing about a
-			// consumer's queue: one that submits elsewhere owns the ownership transfer itself.
-			.queueFamily(QueueFamilyOwnership.shared(0))
+			.state(state)
+			.queueFamily(stated ? QueueFamilyOwnership.shared(family) : QueueFamilyOwnership.ignored())
 			.ownership(ResourceOwnership.BORROWED_PERSISTENT)
 			.lifetime(ResourceLifetime.UNTIL_INVALIDATED)
 			.ready(new SyncPrimitive.AlreadyOrdered(REASON_ORDERED))
 			.release(new SyncPrimitive.Undeclared(REASON_RELEASE))
-			.nativeState(VulkanImageState.unknown())
+			.nativeState(stated ? VulkanImageState.of(state, family, true) : VulkanImageState.unknown())
 			.build();
+	}
+
+	/**
+	 * The API's word for the state the engine reported, which is the one place the engine's answer
+	 * becomes the API's vocabulary - {@code texelFormat} and {@code aspectOf} translate the same way.
+	 * <p>
+	 * Only the general layout is translated, because it is the only layout this engine puts an image
+	 * in. Anything else is not a state this class knows how to describe, and
+	 * {@link ResourceState#UNDEFINED} is the answer that says so rather than one that guesses.
+	 */
+	private static ResourceState resourceState(final EngineImageState imageState) {
+		return imageState.layout() == EngineImageState.GENERAL
+			? ResourceState.GENERAL
+			: ResourceState.UNDEFINED;
 	}
 
 	/** How this frame's depth must be read, which is the pack's copy and not the device image. */
@@ -587,6 +644,11 @@ public final class B3DFrameExport {
 			: texel.name();
 	}
 
+	/** The published state of this image, as the log line that announces it names it. */
+	private static String state(final EngineImage port) {
+		return port.state() == null ? "state unstated" : port.state().describe();
+	}
+
 	/** The aspect a format belongs to, so a consumer does not take a colour view of depth. */
 	private static ImageAspect aspectOf(final TexelFormat format) {
 		return switch (format) {
@@ -608,6 +670,7 @@ public final class B3DFrameExport {
 		private int width;
 		private int height;
 		private GpuFormat format;
+		private EngineImageState state;
 
 		private Slot(final ResourceKey key, final FrameSemantic semantic) {
 			this.key = key;
@@ -624,16 +687,19 @@ public final class B3DFrameExport {
 		 * it had borrowed out. Doing that once a frame would mean a consumer's handle is dead by the next
 		 * frame - which is the opposite of what a {\code BORROWED_PERSISTENT} descriptor with an
 		 * {\code UNTIL_INVALIDATED} lifetime promises - and would fill the diagnostics with a fault this
-		 * engine caused by merely drawing. The four things compared here are the whole of what can
-		 * change about an image the engine keeps in place: which image it is, its view, its extent and
-		 * its format.
+		 * engine caused by merely drawing. The five things compared here are the whole of what can
+		 * change about an image the engine keeps in place: which image it is, its view, its extent, its
+		 * format and where it is - the last of those because a state that moved without the handle
+		 * moving would otherwise leave a consumer describing an image that is no longer there, and a
+		 * replacement is the only way to say so.
 		 */
 		private void publish(final ExternalImage descriptor, final EngineImage port) {
 			final boolean changed = this.image != port.nativeImage()
 				|| this.view != port.nativeView()
 				|| this.width != port.width()
 				|| this.height != port.height()
-				|| this.format != port.format();
+				|| this.format != port.format()
+				|| !java.util.Objects.equals(this.state, port.state());
 
 			if (this.publication != null && this.publication.isOpen()) {
 				if (changed) {
@@ -648,6 +714,7 @@ public final class B3DFrameExport {
 			this.width = port.width();
 			this.height = port.height();
 			this.format = port.format();
+			this.state = port.state();
 		}
 
 		/** Ends the publication, which invalidates every consumer handle onto it. */
@@ -666,6 +733,7 @@ public final class B3DFrameExport {
 			this.width = 0;
 			this.height = 0;
 			this.format = null;
+			this.state = null;
 
 			return true;
 		}

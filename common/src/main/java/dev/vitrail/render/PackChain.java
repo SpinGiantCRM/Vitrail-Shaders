@@ -3,6 +3,7 @@ package dev.vitrail.render;
 import dev.vitrail.dh.DhLods;
 import dev.vitrail.frame.FrameExport;
 import dev.vitrail.frame.EngineImage;
+import dev.vitrail.frame.EngineImageState;
 import dev.vitrail.frame.FrameResources;
 import dev.vitrail.glsl.PackProgram;
 import dev.vitrail.pack.model.ProgramNames;
@@ -189,11 +190,17 @@ public final class PackChain {
 			return null;
 		}
 
+		// Where this frame's images are, read once from the device that made them and handed to every
+		// one of them: the two facts a consumer cannot work out for itself, and the reason the
+		// descriptor path can name a layout instead of claiming nothing. Null on a backend whose
+		// images are not described this way at all, which is the OpenGL one.
+		EngineImageState imageState = EngineImageState.of(RenderSystem.tryGetDevice());
+
 		// The one place the engine's own objects are converted to the port the description path
-		// speaks: everything after this line is a handle, a format and an extent, which is what lets
-		// the rules about replacing and invalidating them be exercised without a device.
+		// speaks: everything after this line is a handle, a format, an extent and a state, which is
+		// what lets the rules about replacing and invalidating them be exercised without a device.
 		EngineImage windowColour =
-				EngineImage.of(main.getColorTexture(), main.getColorTextureView());
+				EngineImage.of(main.getColorTexture(), main.getColorTextureView(), imageState);
 
 		if (windowColour == null) {
 			return null;
@@ -206,7 +213,7 @@ public final class PackChain {
 		GpuTextureView rendered = RenderScale.renderedColourView();
 		EngineImage scene = rendered == null
 				? windowColour
-				: EngineImage.of(rendered.texture(), rendered);
+				: EngineImage.of(rendered.texture(), rendered, imageState);
 		EngineImage upscaled = rendered == null ? null : windowColour;
 
 		if (scene == null) {
@@ -224,8 +231,9 @@ public final class PackChain {
 		// position that is wrong by more the further away it is. MotionVectors carries the long
 		// version of that argument where it does the same thing for its own reprojection.
 		return new FrameResources(scene, upscaled,
-				EngineImage.of(depthView == null ? null : depthView.texture(), depthView),
-				EngineImage.of(vectors.image(), vectorsView), EngineImage.of(vectors.image(), null),
+				EngineImage.of(depthView == null ? null : depthView.texture(), depthView, imageState),
+				EngineImage.of(vectors.image(), vectorsView, imageState),
+				EngineImage.of(vectors.image(), null, imageState),
 				view.gbufferModelView(),
 				view.gbufferPreviousModelView(), view.rendered(), view.previousRendered(),
 				world.cameraPosition(), world.previousCameraPosition(), view.near(), view.far(), index);
