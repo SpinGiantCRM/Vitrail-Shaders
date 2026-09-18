@@ -678,9 +678,15 @@ final class PackDepth {
 	 * whatever is stale when the world's pair moves, and the far terrain's image of this very frame
 	 * is taken EARLIER in it than the world's, so freeing the pair here destroyed an image already
 	 * filled and the deferred stage read the far plane on every frame the screen resized.
+	 * <p>
+	 * The opaque image is retired and the other two are closed, and the difference is what an
+	 * external consumer can reach: that one is what a frame exports as its depth, so a consumer can
+	 * have recorded work against it, while {@code scene} and {@code preHand} are images only a pack
+	 * reads and nothing outside this engine ever holds. That is also why the far terrain's pair is
+	 * closed and not retired in {@link #release}: no publication ever described it.
 	 */
 	private void releaseWorld() {
-		this.opaque = close(this.opaque);
+		this.opaque = retire(this.opaque);
 		this.scene = close(this.scene);
 		this.preHand = close(this.preHand);
 		this.opaqueWritten = false;
@@ -1022,6 +1028,18 @@ final class PackDepth {
 	private static TargetSurface close(TargetSurface surface) {
 		if (surface != null) {
 			surface.close();
+		}
+
+		return null;
+	}
+
+	/**
+	 * Hands an image a consumer may hold back for retirement, and answers null so the caller can
+	 * assign in one line exactly as {@link #close} lets it.
+	 */
+	private static TargetSurface retire(TargetSurface surface) {
+		if (surface != null) {
+			surface.retire();
 		}
 
 		return null;

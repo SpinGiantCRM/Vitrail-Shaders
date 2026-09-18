@@ -53,6 +53,8 @@ import org.joml.Vector3dc;
  * describing it twice would say an upscale happened that did not.
  *
  * @param sceneColour            the frame's finished world colour at the render size, HUD-less
+ * @param sceneColourRetainable  whether that image is one this engine allocated, and so one it can
+ *                               keep alive for a consumer; false when it is the game's own
  * @param upscaledSceneColour    the upscale of it that the window holds, or null when there is none
  * @param depth                  the pack's converted depth copy, or null when there is none
  * @param motionVectors          this frame's vectors, or null when the pass did not draw them
@@ -69,6 +71,7 @@ import org.joml.Vector3dc;
  */
 public record FrameResources(
 		EngineImage sceneColour,
+		boolean sceneColourRetainable,
 		EngineImage upscaledSceneColour,
 		EngineImage depth,
 		EngineImage motionVectors,
@@ -114,6 +117,25 @@ public record FrameResources(
 			// would let a caller publish a descriptor whose resource nothing owns.
 			throw new IllegalArgumentException("motion vectors were drawn, so their image must be there");
 		}
+	}
+
+	/**
+	 * Whether {@link #sceneColour} is an image this engine allocated, and can therefore keep alive
+	 * until a consumer says it is finished with it.
+	 * <p>
+	 * <strong>False is a frame whose world drew straight into the game's own window-sized picture</strong>
+	 * - no render scale engaged - where the scene colour and the window's colour are one image and
+	 * that image belongs to the engine's render target. This engine neither allocated it nor frees it:
+	 * the render target destroys and reallocates it on its own resize, without knowing that a consumer
+	 * exists, and the backend's own deferred destruction is keyed on the engine's submissions rather
+	 * than on anybody else's. So nobody may be handed it under a promise about its lifetime.
+	 * <p>
+	 * Which is why this is carried and not inferred from {@link #upscaledSceneColour} being null. The
+	 * two answers coincide today - a frame that upscaled is a frame that rendered into a stand-in -
+	 * and a reader that needs the fact should be given it rather than a proxy for it.
+	 */
+	public boolean sceneColourRetainable() {
+		return this.sceneColourRetainable;
 	}
 
 	/** Whether this frame has a depth copy a consumer could read. */

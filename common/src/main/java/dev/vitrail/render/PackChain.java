@@ -230,7 +230,10 @@ public final class PackChain {
 		// converted to OpenGL's volume, and pairing one of those with one of these reconstructs a
 		// position that is wrong by more the further away it is. MotionVectors carries the long
 		// version of that argument where it does the same thing for its own reprojection.
-		return new FrameResources(scene, upscaled,
+		// Whether the scene colour is an image this engine allocated, which is the same fact as whether
+		// this frame was rendered small - and asked of the stand-in itself rather than of that, because
+		// what a consumer needs to know is who can keep the image alive, not why it exists.
+		return new FrameResources(scene, rendered != null, upscaled,
 				EngineImage.of(depthView == null ? null : depthView.texture(), depthView, imageState),
 				EngineImage.of(vectors.image(), vectorsView, imageState),
 				EngineImage.of(vectors.image(), null, imageState),

@@ -23,7 +23,9 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.FilterMode;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+import dev.vitrail.frame.ImageRetirement;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.resources.Identifier;
@@ -698,7 +700,7 @@ public final class RenderScale {
 
 	private static void release() {
 		if (scaled != null) {
-			scaled.destroyBuffers();
+			retire(scaled);
 			scaled = null;
 			// With the image and for the same reason: the answer this carries is about a stand-in
 			// that no longer exists, and a stale yes would have the next reader describe a colour
@@ -739,8 +741,12 @@ public final class RenderScale {
 
 	/**
 	 * Makes the scaled target and the intermediate image exist at their sizes, reallocating when
-	 * either moved. Runs while the main target holds the game's own set, so the resize below
-	 * destroys only textures this class allocated.
+	 * either moved. Runs while the main target holds the game's own set, so every texture freed
+	 * here is one this class allocated rather than the game's.
+	 * <p>
+	 * A stand-in the size has moved away from is retired rather than resized in place: the two are
+	 * the same allocation and differ in who waits for the consumer, and only the second can be done
+	 * while a descriptor for the old image is outstanding.
 	 */
 	private static boolean ensure(int width, int height, int outWidth, int outHeight) {
 		if (refusedAtSize && (width != refusedWidth || height != refusedHeight)) {
@@ -756,7 +762,13 @@ public final class RenderScale {
 				scaled = new TextureTarget("Vitrail scaled world", width, height, true, FORMAT);
 				announce(width, height, outWidth, outHeight);
 			} else if (scaled.width != width || scaled.height != height) {
-				scaled.resize(width, height);
+				// A new object rather than a resize in place, and not for tidiness: TextureTarget.resize
+				// destroys the buffers it had and builds new ones, which is exactly the destruction
+				// that now has to wait for a consumer. So the old target is handed over whole and the
+				// new one is what the swap below installs from this frame on.
+				final TextureTarget replaced = scaled;
+				scaled = new TextureTarget("Vitrail scaled world", width, height, true, FORMAT);
+				retire(replaced);
 				announce(width, height, outWidth, outHeight);
 			}
 
@@ -785,6 +797,33 @@ public final class RenderScale {
 	private static void announce(int width, int height, int outWidth, int outHeight) {
 		Vitrail.logger().info("The world renders at {}x{} for a {}x{} window, render scale {}%",
 				width, height, outWidth, outHeight, percent);
+	}
+
+	/**
+	 * Gives a stand-in back to whoever it was allocated for, freeing it now when nothing outside
+	 * this engine holds a descriptor for it and on a later frame when something does.
+	 * <p>
+	 * This is the one destruction path of this class that is not immediate, and the only one that
+	 * has to be: the stand-in is published as the frame's scene colour, so a consumer can have
+	 * recorded GPU work against it and be waiting for that work. The window-sized image it was
+	 * swapped into the target is not this class's to free at all and is not touched here.
+	 */
+	private static void retire(final TextureTarget target) {
+		if (target == null) {
+			return;
+		}
+
+		ImageRetirement.retire(nativeImage(target), "render scale stand-in", target::destroyBuffers);
+	}
+
+	/**
+	 * The native image of a target's colour texture, or zero when it is not one a consumer could be
+	 * handed - the OpenGL backend, whose textures are not described as native resources at all.
+	 */
+	private static long nativeImage(final RenderTarget target) {
+		final GpuTexture texture = ((RenderTargetAccessor) target).vitrail$colorTexture();
+
+		return texture instanceof VulkanGpuTexture vulkan ? vulkan.vkImage() : 0L;
 	}
 
 	/**

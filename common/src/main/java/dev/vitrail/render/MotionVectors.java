@@ -317,10 +317,21 @@ final class MotionVectors {
 		this.drawn = true;
 	}
 
-	/** Frees the image and the buffer behind the block. */
+	/**
+	 * Gives the image and the buffer behind the block back.
+	 * <p>
+	 * <strong>The image is retired rather than freed, and the buffer is freed.</strong> That image is
+	 * what a frame exports as its motion vectors, so a consumer can have recorded work against it and
+	 * be waiting for that work; the uniform buffer no consumer was ever handed, so it goes on this
+	 * line as it always did. This is the path demand withdrawal takes - {@link #standDown} - and the
+	 * one a resize takes, which are the two moments a descriptor can be outstanding against it.
+	 * <p>
+	 * Nothing waits and nothing is held open: an image nothing outside this engine has a descriptor
+	 * for is freed inside {@link TargetSurface#retire}.
+	 */
 	void release() {
 		if (this.vectors != null) {
-			this.vectors.close();
+			this.vectors.retire();
 			this.vectors = null;
 		}
 
@@ -372,9 +383,11 @@ final class MotionVectors {
 
 		try {
 			// The old one first: a resize that allocates before freeing holds two full screen images
-			// at once, and the size that fails is the size that was already tight.
+			// at once, and the size that fails is the size that was already tight. Retired and not
+			// freed, for the reason release() gives: this is the frame a consumer's descriptor for the
+			// superseded image is still live on.
 			if (this.vectors != null) {
-				this.vectors.close();
+				this.vectors.retire();
 				this.vectors = null;
 			}
 

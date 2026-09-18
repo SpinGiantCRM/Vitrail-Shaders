@@ -5,6 +5,8 @@ import com.mojang.blaze3d.systems.GpuDevice;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
+import dev.vitrail.frame.ImageRetirement;
 import net.minecraft.util.Mth;
 
 /**
@@ -212,6 +214,36 @@ final class TargetSurface implements AutoCloseable {
 			close();
 			throw e;
 		}
+	}
+
+	/**
+	 * Retires this surface instead of freeing it: it stops being published now, and its image is
+	 * freed once no consumer outside this engine can still be reading it.
+	 * <p>
+	 * <strong>Only for a surface an external consumer can hold, and only where the engine really
+	 * stops wanting it.</strong> Every other surface of this engine is still closed with
+	 * {@link #close()}, on the line it always was: an image nothing outside the engine has a
+	 * descriptor for has nobody to wait for, and asking would be a call into the export on every
+	 * target this engine reallocates. {@link ImageRetirement} answers the question for an image
+	 * that was never published by freeing it inside the call, so a session with nothing listening
+	 * takes the same path it always took.
+	 * <p>
+	 * A surface with no native image - the OpenGL backend - is freed outright, there being nothing a
+	 * consumer could have been handed.
+	 */
+	void retire() {
+		ImageRetirement.retire(nativeImage(), this.label, this::close);
+	}
+
+	/**
+	 * The native image behind this surface's base level, or zero when it is not one a consumer could
+	 * be handed. The same test {@link dev.vitrail.frame.EngineImage#of} makes, and the same reason:
+	 * the one thing that tells this backend's texture from any other is whether it is one.
+	 */
+	private long nativeImage() {
+		final GpuTexture texture = this.texture;
+
+		return texture instanceof VulkanGpuTexture vulkan ? vulkan.vkImage() : 0L;
 	}
 
 	/**

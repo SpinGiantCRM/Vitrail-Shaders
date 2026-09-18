@@ -3,6 +3,7 @@ package dev.vitrail.render;
 import dev.vitrail.Vitrail;
 import dev.vitrail.frame.FrameExport;
 import dev.vitrail.frame.FrameResources;
+import dev.vitrail.frame.ImageRetirement;
 
 import com.mojang.blaze3d.GpuDeviceLossException;
 import com.mojang.blaze3d.pipeline.RenderTarget;
@@ -29,6 +30,13 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
  * describe, and the colour left in the game's target is the game's own. {@link PackChain#exportFrame}
  * answers null there and this method returns, which is what keeps a stack with no pack out of an
  * export that would otherwise be describing somebody else's frame.
+ * <p>
+ * <strong>It is also where a retired image is freed.</strong> The engine's own images are handed
+ * back when the engine loses interest in them - a resize, a pack reload, a scale standing down -
+ * but an image a consumer was handed may only be freed once that consumer is finished with it, and
+ * this is the once-a-frame point that asks. See {@link ImageRetirement}: the answer comes from the
+ * external API's own accounting, and a session nobody is exporting frees its images on the same
+ * line it always did.
  * <p>
  * <strong>A failure here cannot take the frame with it.</strong> This describes a frame the game is
  * in the middle of drawing, and a description is not worth failing one over. The first failure says
@@ -60,6 +68,13 @@ public final class WorldFrameExport {
 	 * @param main the game's own render target, holding the window-sized set by the time this runs
 	 */
 	public static void publish(final RenderTarget main) {
+		// First, and whoever is listening: an image this engine retired is freed on the frame every
+		// consumer of it is finished, which is a question about those consumers and not about
+		// whether this frame is exported. This is the one place per frame the answer can be asked
+		// at, and it costs one read of a list on every frame nothing was retired on - which is
+		// every frame of a session that replaces no image.
+		ImageRetirement.drain();
+
 		final FrameExport.Sink exporter = FrameExport.sink();
 
 		if (exporter == null || exporter == broken) {

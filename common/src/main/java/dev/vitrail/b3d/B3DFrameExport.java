@@ -3,6 +3,8 @@ package dev.vitrail.b3d;
 import dev.vitrail.Vitrail;
 import dev.vitrail.frame.FrameExport;
 import dev.vitrail.frame.FrameResources;
+import dev.vitrail.frame.ImageRetirement;
+import dev.vitrail.mixin.access.GpuDeviceAccessor;
 
 import b3dinterop.api.backend.GraphicsApi;
 import b3dinterop.api.frame.FrameColorInfo;
@@ -18,6 +20,7 @@ import b3dinterop.api.frame.DepthConvention;
 import b3dinterop.api.frame.TemporalFrameInfo;
 import b3dinterop.api.resource.ExternalImage;
 import b3dinterop.api.resource.ExternalResourceExchange;
+import b3dinterop.api.resource.GenerationRetirement;
 import b3dinterop.api.resource.ImageAspect;
 import b3dinterop.api.resource.QueueFamilyOwnership;
 import b3dinterop.api.resource.ResourceKey;
@@ -31,11 +34,22 @@ import b3dinterop.api.sync.SyncPrimitive;
 
 import com.mojang.blaze3d.GpuDeviceLossException;
 import com.mojang.blaze3d.GpuFormat;
+import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.vitrail.frame.EngineImage;
 import dev.vitrail.frame.EngineImageState;
 import org.joml.Vector3dc;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VK12;
+import org.lwjgl.vulkan.VkDevice;
 
+import java.nio.LongBuffer;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -53,26 +67,55 @@ import java.util.Set;
  * one the engine made for its own rendering, described with its live handle: no render target exists
  * because of this class, no pixel is read on the CPU, and no lifetime is changed. The ownership
  * declared on every descriptor is {@link ResourceOwnership#BORROWED_PERSISTENT}, which is the whole
- * of the answer to "who may destroy it" - this engine, on the same paths as before, whether or not
- * anybody is listening.
+ * of the answer to "who may destroy it" - this engine.
+ * <p>
+ * <strong>And it is kept, which is the half of that promise a borrowed descriptor cannot keep on its
+ * own.</strong> A path that used to free an exported image on the spot now retires it: the
+ * publication ends at once, so no consumer may acquire a generation that is about to stop existing,
+ * and the native image is freed on the frame every consumer is finished with it - every descriptor
+ * accounted for and every completion primitive they named reached. Which is a division of labour:
+ * the accounting is the exchange's, since it is the thing that handed the descriptors out, and the
+ * waiting is this engine's, since it is the thing that owns the images. {@link Ledger} is where the
+ * two meet, and {@link ImageRetirement} is what the renderer calls.
+ * <p>
+ * <strong>A stack nobody is exporting is unaffected.</strong> With nothing installed, or with no
+ * consumer having ever acquired a descriptor, retirement frees the image inside the call that used to
+ * free it: same line, same frame, no queue, no waiting and no allocation. Only an image with a real
+ * outstanding obligation waits for anything, and it waits without blocking: the completion is asked
+ * about, never waited on.
  * <p>
  * <strong>What is published and what is not.</strong> Scene colour is the frame the chain finished,
- * without the interface, at the size the pack drew it - the render size, which is the window's size
- * only while the render scale is off. When the scale is engaged the world is drawn into a stand-in
- * smaller than the window and this engine's own upscale of it is what the window ends up holding, so
- * that second picture is published separately as {@code b3d:upscaled_scene_color}. One semantic per
- * resource: a consumer that upscales needs the scene at the render size, a consumer that composites
- * what the player sees needs the upscale, and neither can tell which it has been handed if one image
- * is offered as both. On a frame the scale did not engage there is no distinct upscale and the second
- * semantic is not published at all - a hundred percent is not a degenerate upscale, it is the
- * absence of one, and the scene colour is then simply the image the window holds.
+ * without the interface, at the size the pack drew it: the render size, which is the window's size
+ * only while the render scale is off. It is published on the frames the render scale draws the world
+ * into a stand-in of this engine's own - a stand-in this engine allocates, recreates and frees, and
+ * can therefore keep alive for a consumer after the scale stops using it.
  * <p>
- * Depth is the pack's own converted copy rather than the device's image: forward over 0..1, at the
- * render size, and it outlives the clear that destroys the device's window-sized depth. Motion
- * vectors are the engine's existing pass, published only on a frame it drew, which is only when a
- * consumer asked for them. <strong>Exposure is not published at all</strong>, because this engine has
+ * It is <em>not</em> published on the frames the world draws straight into the window's target, which
+ * is the game's own texture: this engine neither allocated it nor frees it, so it cannot defer that
+ * destruction, and a borrowed descriptor over it would be a lifetime promise this engine has no way to
+ * keep. The window's finished picture is not published under any semantic for the same reason. A
+ * consumer that wants the scene at the render size is served by the stand-in frames and gets no
+ * descriptor at all on the others, rather than one it cannot rely on.
+ * <p>
+ * Depth is the pack's own converted copy rather than the device's image, and every image that is
+ * published at all is one this engine allocated: forward over 0..1, at the render size, and it outlives the
+ * clear that destroys the device's window-sized depth. Motion vectors are the engine's existing
+ * pass, published only on a frame it drew, which is only when a consumer asked for them. <strong>Exposure is not published at all</strong>, because this engine has
  * no exposure value: the packs that compute one do it inside their own shaders from images this
  * engine hands them, and inventing a number here would be inventing metadata.
+ * <p>
+ * <strong>The window's own colour is not published, under any semantic.</strong> On a frame the
+ * render scale did not engage, scene colour and the window's picture are one image, and that image is
+ * the game's render target's colour texture - which this engine did not allocate, does not resize and
+ * does not free. It is destroyed by the engine's own resize path, on the frame the window moves, with
+ * no knowledge that a consumer exists; the backend does defer that destruction
+ * ({@code VulkanCommandEncoder.queueForDestroy}, after a fixed number of its own submissions) but the
+ * deferral is keyed on the engine's submit count and cannot take an external completion, so it is not
+ * a lifetime this API can promise anything about. A publication that said "borrowed until this engine
+ * invalidates it" over that image would be saying something this engine cannot make true, and a
+ * consumer that submitted work against it could be writing into an image the engine freed a frame
+ * later. So on such a frame the scene colour is <strong>absent</strong>, which is an answer a consumer
+ * can act on, rather than late every time the window moves.
  * <p>
  * <strong>Colour is reported as unknown, and that is not a gap.</strong> A storage format is not an
  * encoding: nothing in this engine or in the game knows this picture's primaries or transfer
@@ -121,12 +164,15 @@ public final class B3DFrameExport {
 
 	private static final Slot SCENE_COLOUR =
 		new Slot(ResourceKey.of(NAMESPACE, "scene_colour"), FrameSemantic.SCENE_COLOR);
-	private static final Slot UPSCALED_SCENE_COLOUR =
-		new Slot(ResourceKey.of(NAMESPACE, "upscaled_scene_colour"),
-				FrameSemantic.UPSCALED_SCENE_COLOR);
 	private static final Slot DEPTH = new Slot(ResourceKey.of(NAMESPACE, "depth"), FrameSemantic.DEPTH);
 	private static final Slot MOTION_VECTORS =
 		new Slot(ResourceKey.of(NAMESPACE, "motion_vectors"), FrameSemantic.MOTION_VECTORS);
+
+	/**
+	 * Every semantic's slot, for the one question that arrives by native handle rather than by
+	 * semantic: the engine hands an image back by the handle it published it with and nothing else.
+	 */
+	private static final List<Slot> SLOTS = List.of(SCENE_COLOUR, DEPTH, MOTION_VECTORS);
 
 	private static FrameSession session;
 	private static long exported;
@@ -135,6 +181,39 @@ public final class B3DFrameExport {
 	private static boolean motionVectorsWanted;
 	private static boolean planesAbsentSaid;
 	private static long lastDemandVersion = -1L;
+
+	/**
+	 * The generations standing over images consumers have been handed, by native image handle.
+	 * <p>
+	 * An entry is written when a generation ends over an image that is still alive - which is the
+	 * moment this class learns that a consumer may still be using it - and removed when the image has
+	 * been freed and the exchange has been told it may forget the generation. Bounded by the
+	 * generations that have ended and not yet been destroyed, which on a session that replaces no
+	 * image is none of them.
+	 */
+	private static final Map<Long, Watch> watching = new LinkedHashMap<>();
+
+	/**
+	 * Images whose wait has already been explained in the log, so that a hold that lasts many frames
+	 * is one line and not one per frame. Removed with the watch it belongs to.
+	 */
+	private static final Set<Long> explained = new LinkedHashSet<>();
+
+	/**
+	 * Images whose completion could not be observed at all, once each. Kept apart from
+	 * {@link #explained} so that the one case that is a consumer's mistake to fix cannot be silenced
+	 * by an earlier line about the same image.
+	 */
+	private static final Set<Long> unobservable = new LinkedHashSet<>();
+
+	/** One ended generation and the publication that can still answer for it. */
+	private record Watch(ResourceKey key, ResourcePublication publication, long generation) {
+	}
+
+	/**
+	 * Said once per session, because it is a property of this engine's frame and not of a frame.
+	 */
+	private static boolean windowColourSaid;
 
 	/**
 	 * Semantics this export has stood down from, once each: one another provider already put in a
@@ -169,13 +248,19 @@ public final class B3DFrameExport {
 		}
 
 		session = FrameExchange.attach(PROVIDER_ID);
-		session.advertises(Set.of(FrameSemantic.SCENE_COLOR, FrameSemantic.UPSCALED_SCENE_COLOR,
-			FrameSemantic.DEPTH, FrameSemantic.MOTION_VECTORS));
+		// Not the upscale of the scene, and not the window's colour when there is no render scale:
+		// both are the game's render target's own image, which this engine cannot keep alive for a
+		// consumer. What is advertised is what this engine can honour.
+		session.advertises(Set.of(FrameSemantic.SCENE_COLOR, FrameSemantic.DEPTH,
+			FrameSemantic.MOTION_VECTORS));
 		FrameExport.install(B3DFrameExport::onFrame);
+		// Before the first frame can be exported: an image retired on a frame this is set on has an
+		// answer from the exchange, and one retired before it does not need a question asked.
+		ImageRetirement.ledger(new Ledger());
 
 		Vitrail.logger().info("Publishing this engine's frames to {} as {}: the scene colour at the "
-			+ "render size, its upscale when the render scale is engaged, depth, and motion vectors "
-			+ "when a consumer asks for them", B3D_MOD_ID, PROVIDER_ID);
+			+ "render size while the render scale is engaged, depth, and motion vectors when a "
+			+ "consumer asks for them", B3D_MOD_ID, PROVIDER_ID);
 	}
 
 	/** Detaches the export, closing everything it published. Idempotent. */
@@ -188,9 +273,11 @@ public final class B3DFrameExport {
 
 		FrameExport.uninstall();
 		SCENE_COLOUR.close();
-		UPSCALED_SCENE_COLOUR.close();
 		DEPTH.close();
 		MOTION_VECTORS.close();
+		// Deliberately not removed: retiring a generation is a fact about the exchange and not about
+		// this session, and a generation an earlier session ended can still be outstanding. Nothing
+		// accumulates by leaving it - a closed publication answers every image immediately.
 		session.close();
 		session = null;
 		motionVectorsDrawn = false;
@@ -250,20 +337,22 @@ public final class B3DFrameExport {
 
 		exported = frame.index();
 
-		final boolean colourClaimed =
-			contributeImage(snapshot, frameId, SCENE_COLOUR, frame.sceneColour());
-		boolean upscaledClaimed = false;
+		// The window's picture is never published, on any frame, under any semantic - there is no slot
+		// for it and the semantic is not advertised, so a consumer reading the exchange sees no such
+		// resource rather than one whose lifetime means nothing. Said once, because it is a property
+		// of this engine's frame and not of a frame.
+		sayWindowColour();
 
-		if (frame.hasUpscaledSceneColour()) {
-			upscaledClaimed = contributeImage(snapshot, frameId, UPSCALED_SCENE_COLOUR,
-					frame.upscaledSceneColour());
+		final boolean colourClaimed;
+
+		if (frame.sceneColourRetainable()) {
+			colourClaimed = contributeImage(snapshot, frameId, SCENE_COLOUR, frame.sceneColour());
 		} else {
-			// The frame was not rendered small, so the window's picture is the scene and not a second
-			// resource. The publication ends rather than standing over the window-sized colour from a
-			// frame whose scale has since been turned off, which a consumer would read as this frame's
-			// upscale - the one thing the exchange keeps a description from doing is describing a frame
-			// that is not the open one.
-			UPSCALED_SCENE_COLOUR.close();
+			// The scale is off, so the world drew straight into that same window-sized picture and
+			// this frame has no scene colour of this engine's to lend. The publication ends rather
+			// than standing over an image a consumer cannot be told anything true about.
+			SCENE_COLOUR.close();
+			colourClaimed = false;
 		}
 
 		boolean depthClaimed = false;
@@ -294,7 +383,7 @@ public final class B3DFrameExport {
 		// armed, and this says it ran.
 		sayDrawn(frame.hasMotionVectors());
 
-		if (!colourClaimed && !upscaledClaimed && !depthClaimed && !vectorsClaimed) {
+		if (!colourClaimed && !depthClaimed && !vectorsClaimed) {
 			// Nothing of this frame is this engine's to describe - no pack is drawing it, or the
 			// backend is not Vulkan - so its camera state is not published either. A frame with
 			// metadata and no resources would be a description of somebody else's frame.
@@ -426,6 +515,26 @@ public final class B3DFrameExport {
 		}
 
 		return false;
+	}
+
+	/**
+	 * Says once per session why the window's own picture is not published.
+	 * <p>
+	 * Worth a line rather than silence: a consumer looking for an upscaled frame finds no semantic
+	 * instead of one, and the reason is a fact about who owns that image - not a defect, and not
+	 * something the reader could work out from the frame alone.
+	 */
+	private static void sayWindowColour() {
+		if (windowColourSaid) {
+			return;
+		}
+
+		windowColourSaid = true;
+		Vitrail.logger().info("The window's own colour is not published: it is the game's render target's "
+			+ "texture, which this engine neither allocated nor frees, so its destruction cannot be "
+			+ "deferred for a consumer. Depth and motion vectors, which this engine does own, are "
+			+ "published as usual, and the scene colour is published on the frames the render scale "
+			+ "draws into a stand-in of this engine's own.");
 	}
 
 	/** Says once that this backend cannot describe the engine's textures. */
@@ -659,6 +768,221 @@ public final class B3DFrameExport {
 		};
 	}
 
+	/**
+	 * What this export tells the engine when the engine hands one of its images back.
+	 * <p>
+	 * Three questions, asked in the order the engine asks them, and the exchange answers all three
+	 * from its own record of who was handed what:
+	 * <ul>
+	 *   <li>{@link #ended} - the publication over this image ends <em>now</em>, so that a consumer
+	 *       cannot acquire a generation that is about to stop existing. The generation is remembered
+	 *       first: it is the only handle onto the record of what those consumers said, and after the
+	 *       close the publication stops being the place a consumer looks while still being able to
+	 *       answer about what it ended;</li>
+	 *   <li>{@link #finished} - has every consumer of that generation said something final, and has
+	 *       every completion primitive they named been reached? Answered from the live record, not
+	 *       from a count this class keeps: one source of truth about who is using what, and it is
+	 *       the exchange's;</li>
+	 *   <li>{@link #forgotten} - the image has been freed, so the exchange may forget the
+	 *       generation and stop growing a session's worth of records.</li>
+	 * </ul>
+	 * <p>
+	 * <strong>Nothing here blocks.</strong> A completion is asked about and never waited on: reading
+	 * a timeline semaphore's counter and a fence's status are host queries, they cost a call, and a
+	 * no is answered with "not yet" and asked again on a later frame. A frame that is drawing is not
+	 * a frame that may stall on the GPU.
+	 * <p>
+	 * <strong>An image nothing was published over is finished with immediately</strong>, which is the
+	 * ordinary case in a session nobody is consuming frames in and the reason retirement costs
+	 * nothing there.
+	 */
+	private static final class Ledger implements ImageRetirement.Ledger {
+
+		@Override
+		public void ended(final long nativeImage) {
+			final Slot slot = standing(nativeImage);
+
+			if (slot == null) {
+				return;
+			}
+
+			final ResourcePublication publication = slot.publication;
+			// Read before the close, which is the last moment this is the current generation: after it
+			// the generation is a retirement, and a retirement answers about itself the same way.
+			final long generation = publication.generation();
+			watch(nativeImage, slot.key, publication, generation);
+			publication.close();
+		}
+
+		@Override
+		public boolean finished(final long nativeImage) {
+			final Watch watch = watching.get(nativeImage);
+
+			if (watch == null) {
+				// No publication ever stood over this image, so no consumer outside this engine can have
+				// been handed it and there is nobody to wait for.
+				return true;
+			}
+
+			final Optional<GenerationRetirement> ended =
+					watch.publication().retirementOf(watch.generation());
+
+			if (ended.isEmpty()) {
+				// The record is gone: the generation was never handed out, or it has already been
+				// acknowledged. Neither leaves an obligation behind.
+				return true;
+			}
+
+			final GenerationRetirement generation = ended.get();
+
+			if (!generation.accountedFor()) {
+				// A consumer acquired a descriptor and has said nothing final about it - a frame scope it
+				// did not close, or a release it never made. The exchange cannot tell that from a
+				// submission still running, so neither can this, and the image waits.
+				sayWaiting(generation, nativeImage);
+
+				return false;
+			}
+
+			return completionsReached(generation, nativeImage);
+		}
+
+		@Override
+		public void forgotten(final long nativeImage) {
+			final Watch watch = watching.remove(nativeImage);
+			explained.remove(nativeImage);
+			unobservable.remove(nativeImage);
+
+			if (watch == null) {
+				return;
+			}
+
+			if (!watch.publication().acknowledgeRetirement(watch.generation())) {
+				// Reachable only if the record was already dropped, since nothing can acquire a closed
+				// publication and a handle that has said something final cannot say it twice. The exchange
+				// keeps a record it will not forget and says so itself, so this only has to not act on
+				// the refusal.
+				Vitrail.logger().info("The exchange is still holding the record of {} generation {}; "
+						+ "it is left to the exchange rather than forgotten here", watch.key().id(),
+					watch.generation());
+			}
+		}
+	}
+
+	/**
+	 * The slot whose publication stands over this image, or null when none does.
+	 * <p>
+	 * Matched on the native handle, which is the only thing the engine knows about the image it is
+	 * handing back, and which is exactly what the slot compares to decide that a resource was
+	 * replaced. A slot whose publication is already ended is not the one standing: its generation is
+	 * remembered instead, and remembered when it ended.
+	 */
+	private static Slot standing(final long nativeImage) {
+		for (final Slot slot : SLOTS) {
+			if (slot.image == nativeImage && slot.publication != null && slot.publication.isOpen()) {
+				return slot;
+			}
+		}
+
+		return null;
+	}
+
+	/** Records the generation that ended over an image that is still alive. */
+	private static void watch(final long nativeImage, final ResourceKey key,
+			final ResourcePublication publication, final long generation) {
+		if (nativeImage != 0L) {
+			watching.put(nativeImage, new Watch(key, publication, generation));
+		}
+	}
+
+	/**
+	 * Whether every completion this generation's consumers named has been reached.
+	 * <p>
+	 * All of them and not any of them: two consumers that both submitted work are two obligations,
+	 * and the image is freed when the last is reached rather than the first. The order they are asked
+	 * in is the order they were released in, so a generation whose consumers are already done answers
+	 * on the first call.
+	 */
+	private static boolean completionsReached(final GenerationRetirement generation,
+			final long nativeImage) {
+		boolean reached = true;
+
+		for (final SyncPrimitive completion : generation.gpuCompletions()) {
+			if (!reached(completion, nativeImage)) {
+				reached = false;
+			}
+		}
+
+		return reached;
+	}
+
+	/** One completion primitive, asked about without waiting on it. */
+	private static boolean reached(final SyncPrimitive completion, final long nativeImage) {
+		final VkDevice device = device();
+
+		if (completion instanceof SyncPrimitive.TimelineSemaphore timeline) {
+			if (timeline.value() <= 0L) {
+				// A timeline semaphore's counter starts at zero and only rises, so a consumer naming its
+				// starting value is saying it has nothing outstanding - the obligation cannot be anything
+				// but reached, and asking the device would be asking it to confirm an arithmetic fact.
+				return true;
+			}
+
+			if (device == null) {
+				return false;
+			}
+
+			try (MemoryStack stack = MemoryStack.stackPush()) {
+				final LongBuffer value = stack.callocLong(1);
+
+				return VK12.vkGetSemaphoreCounterValue(device, timeline.semaphore(), value)
+							== VK10.VK_SUCCESS
+						&& value.get(0) >= timeline.value();
+			}
+		}
+
+		if (completion instanceof SyncPrimitive.Fence fence) {
+			return device != null && VK10.vkGetFenceStatus(device, fence.fence()) == VK10.VK_SUCCESS;
+		}
+
+		// A binary semaphore, and Vulkan gives the host no way to ask one whether it has been
+		// signalled: every way of observing it either consumes it or needs more work submitted, and
+		// the exchange documents deferred destruction as tied to a timeline semaphore or a fence for
+		// exactly this reason. So this is not "not yet", it is "nobody can say", and the image waits
+		// rather than being freed on a question that was never answered.
+		sayUnobservable(completion, nativeImage);
+
+		return false;
+	}
+
+	/** The Vulkan device this frame is drawing on, or null when there is none to ask. */
+	private static VkDevice device() {
+		final GpuDevice front = RenderSystem.tryGetDevice();
+
+		return front != null
+				&& ((GpuDeviceAccessor) front).vitrail$backend() instanceof VulkanDevice vulkan
+				? vulkan.vkDevice()
+				: null;
+	}
+
+	/** Says once why one image is being held, rather than once a frame for as long as it is. */
+	private static void sayWaiting(final GenerationRetirement generation, final long nativeImage) {
+		if (explained.add(nativeImage)) {
+			Vitrail.logger().info("Holding an exported image until a consumer accounts for it: {}",
+					generation.describe());
+		}
+	}
+
+	/** Says once, for the same reason. */
+	private static void sayUnobservable(final SyncPrimitive completion, final long nativeImage) {
+		if (unobservable.add(nativeImage)) {
+			Vitrail.logger().error("A consumer released an exported image with {}, which this engine "
+					+ "cannot observe: Vulkan offers the host no query for one. The image is kept rather "
+					+ "than freed, and a consumer that means to be waited on should name a timeline "
+					+ "semaphore or a fence", completion.describe());
+		}
+	}
+
 	/** One semantic's publication and what was last published under it. */
 	private static final class Slot {
 
@@ -717,13 +1041,27 @@ public final class B3DFrameExport {
 			this.state = port.state();
 		}
 
-		/** Ends the publication, which invalidates every consumer handle onto it. */
+		/**
+		 * Ends the publication, which invalidates every consumer handle onto it.
+		 * <p>
+		 * A generation that ends here over an image the engine has not been asked about yet is
+		 * remembered, and that is the whole reason this is not one line: the image is still alive, a
+		 * consumer that had acquired it can still have work outstanding against it, and the engine will
+		 * free it later through a path that knows nothing about this slot. The entry is what lets that
+		 * question be answered then.
+		 * <p>
+		 * An already ended generation is not remembered again. It was remembered when it ended - by
+		 * {@link Ledger#ended}, which is the engine saying it is about to free the image - and a
+		 * generation whose record has since been acknowledged must not be brought back by a slot
+		 * forgetting it.
+		 */
 		private boolean close() {
 			if (this.publication == null) {
 				return false;
 			}
 
 			if (this.publication.isOpen()) {
+				watch(this.image, this.key, this.publication, this.publication.generation());
 				this.publication.close();
 			}
 
