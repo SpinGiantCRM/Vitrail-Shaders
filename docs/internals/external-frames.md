@@ -101,13 +101,49 @@ respect:
 The engine records its work into the frame's own command buffer, which the game submits at the end of
 the frame, and it does not own that submission. So the export claims the weakest honest thing:
 
-- **ready** - already ordered: a consumer that opens its own work after the frame boundary, on the
-  same queue family, is ordered behind the engine's submission.
+- **ready** - already ordered: the frame's work is recorded into the engine's own command buffer and
+  submitted at the frame's end, and a consumer of this API records on that same graphics queue - its
+  submission is behind the engine's in queue order, against the same queue family. That order is an
+  execution dependency and not a memory one: the barrier a consumer records from the published state
+  is what makes the frame's writes visible to its reads.
 - **release** - not declared: the engine cannot name a consumer's completion primitive, and it does
-  not guess at one.
+  not guess at one. A consumer that borrows an image states its own completion, and it must finish
+  with an image before the engine replaces or frees it - a replacement is reported as a new
+  generation, and a handle from the old one is refused, so the deadline is observable rather than
+  guessed at.
 
 Nothing is read back, copied, or waited on. There is no frame counter anywhere in this mechanism, and
 no deferred destruction: an image is freed when the engine no longer needs it, and a consumer is told.
+
+## Where the images are
+
+A descriptor that names no state cannot be used for GPU work, so every descriptor states two facts a
+consumer cannot work out for itself:
+
+- **the layout** - always `VK_IMAGE_LAYOUT_GENERAL`, because that is where every image this engine
+ows lives for its whole life. It is not tracked per image and it is not a guess: a texture is created
+with `initialLayout` of `VK_IMAGE_LAYOUT_UNDEFINED` and transitioned to `VK_IMAGE_LAYOUT_GENERAL`
+once, in its constructor; dynamic rendering names the general layout for every colour and depth
+attachment; every sampled and storage descriptor names it; and the only two transitions in the whole
+game are that constructor's and the swapchain's, which is not one of these images. The stage and
+access masks published with it are the widest legal scope for that layout rather than this frame's
+precise last write - wide is the safe direction for a barrier's source scope.
+- **the queue family** - the family of the graphics queue of the device that created the image, read
+from the device and not written down as family zero. Zero is a property of a card's family layout,
+not of the engine.
+
+The layout is the fact that matters: `VK_IMAGE_LAYOUT_UNDEFINED` is not a way of saying "nobody
+knows", because as a barrier's old layout it permits the contents to be discarded, which would make a
+consumer read a frame that is no longer there. An image whose state could not be read is published as
+undefined and flagged as not exact rather than described as something it might not be, and the
+publication is replaced when the state moves even though the handle did not - a consumer holding the
+old descriptor would otherwise be describing an image that is no longer there.
+
+What is checked, and by whom: an outside validation consumer reads each descriptor and records a
+same-layout image barrier naming the *published* layout as its old layout, on the engine's own command
+stream. It writes nothing, samples nothing and leaves every image where it found it. If the
+publication were wrong, the validation layer's own layout tracking - not this engine's - would report
+it.
 
 ## The optional dependency
 
